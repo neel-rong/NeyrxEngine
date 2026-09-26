@@ -1,0 +1,11 @@
+# Build
+build/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# CMake
+CMakeUserPresets.json
+CMakeSettings.json
