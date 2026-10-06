@@ -1,14 +1,20 @@
 #pragma once
 #include <string_view>
-#include "Container/Queue.h"
 #include <iostream>
 #include <stdio.h>
 #include <chrono>
 #include <array>
 #include <thread>
+#include <cassert>
+#include "Container/Queue.h"
+#include <semaphore>
 
 static constexpr uint64_t InvalidSequenceNumber = std::numeric_limits<uint64_t>::max();
 static constexpr uint64_t Invalidindex = std::numeric_limits<uint64_t>::max();
+
+static constexpr std::size_t m_numberOfThreads = 4;
+
+using namespace std::chrono_literals;
 
 void TRACE(uint64_t sequence, std::string event)
 {
@@ -94,13 +100,14 @@ namespace Neyrx
 			LogData& operator=(const LogData&) = default;
 			LogData& operator=(LogData&&) noexcept = default;
 
-			LogData(LogLevel InLevel, LogCategory InCategory,std::string InMsg, uint64_t InSequenceNumber) :
+			LogData(LogLevel InLevel, LogCategory InCategory, std::string InMsg, uint64_t InSequenceNumber) :
 				m_level(InLevel),
 				m_category(InCategory),
 				m_msg(std::move(InMsg)),
 				m_sequence(InSequenceNumber),
 				m_time(std::chrono::system_clock::now())
-			{ }
+			{
+			}
 
 			void PrintData() const
 			{
@@ -117,53 +124,74 @@ namespace Neyrx
 		};
 
 
+		// ====================================
+		// Logger Sink
+		// ====================================
+
+		class ILoggerSink
+		{
+		public:
+			virtual ~ILoggerSink() = default;
+
+			virtual void Consume(const LogData& InLogData) = 0;
+		};
+
+
+		class IConsoleSink : public ILoggerSink
+		{
+		public:
+			virtual ~IConsoleSink() = default;
+			inline virtual void Consume(const LogData& InLogData) override
+			{
+				InLogData.PrintData();
+			}
+		};
+
+
 		static class LoggerClass
 		{
 		public:
 
-			LoggerClass() : m_loggerState() {}
+			LoggerClass() : m_loggerState(), m_semaphoreNextSequence(0) {}
 
 			// Member Functions
 			inline void QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string InMsg)
 			{
 				uint64_t sequenceNumber = m_globalSequenceNumber.fetch_add(1, std::memory_order_relaxed);
-				g_threadContext->InflightSequenceNumber.store(sequenceNumber, std::memory_order_release);
 
-				std::this_thread::sleep_for(std::chrono::microseconds(3));
+				if (!g_threadContext->m_logBuffer.IsFull())
+				{
+					g_threadContext->m_logBuffer.Enqueue(LogData(InLevel, InCategory, InMsg, sequenceNumber));
 
-				g_threadContext->m_logBuffer.Enqueue(LogData(InLevel, InCategory, InMsg, sequenceNumber));
-
-				g_threadContext->InflightSequenceNumber.store(InvalidSequenceNumber, std::memory_order_release);
-
+					if (sequenceNumber == m_lastConsumedSequenceNumber.load(std::memory_order_relaxed) + 1)
+					{
+						m_semaphoreNextSequence.release();
+					}
+				}
+				else
+				{
+					std::cout << "\nQueue is Full. Dropping Log!!!!!!!!" << std::endl;
+					m_skippedLogs.fetch_add(1, std::memory_order_release);
+				}
 			}
 
 			inline bool StageThreadContexts()
 			{
 				bool staged = false;
 
-				for (size_t i = 0; i < m_loggerState.m_threadContexts.size(); ++i)
+				for (std::size_t i = 0; i < m_loggerState.m_threadContexts.size(); ++i)
 				{
-					if (!m_stagedQueue.IsInvalid(i)) continue;
+					assert(m_stagedQueue.IsValidQueueIndex(i));
+					assert(m_loggerState.IsValidThreadIndex(i));
 
-					if (m_loggerState.m_threadContexts[i].m_logBuffer.IsEmpty())
+					if (!m_stagedQueue.IsInvalidSequence(i)) continue;
+
+					ThreadContext& context = m_loggerState.m_threadContexts[i];
+
+					LogData* data = m_stagedQueue.GetData(i);
+
+					if (context.m_logBuffer.Dequeue(*data))
 					{
-						if (m_loggerState.m_threadContexts[i].InflightSequenceNumber.load(std::memory_order_relaxed) != InvalidSequenceNumber)
-						{
-							std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-							if (m_loggerState.m_threadContexts[i].m_logBuffer.IsEmpty()) continue;
-						}
-						else
-						{
-							continue;
-						}
-					}
-
-					LogData logData;
-
-					if (m_loggerState.m_threadContexts[i].m_logBuffer.Dequeue(logData))
-					{
-						m_stagedQueue.StageData(std::move(logData), i);
 						staged = true;
 					}
 				}
@@ -175,19 +203,45 @@ namespace Neyrx
 			{
 				StageThreadContexts();
 
-				const std::size_t index = m_stagedQueue.GetNextQueueIndexFromSequence();
+				if (m_stagedQueue.IsStageEmpty()) return;
 
-				if(index == Invalidindex)
+				std::size_t index = m_stagedQueue.GetNextIndexFromSequenceNumber();
+
+				if (index == Invalidindex) return; // TODO - all queues are empty, need to sleep until atleast one queue is full
+
+				LogData* data = m_stagedQueue.GetData(index);
+
+				uint64_t expected;
+
+				uint64_t lastConsumed = m_lastConsumedSequenceNumber.load(std::memory_order_relaxed);
+
+				if (m_lastConsumedSequenceNumber == InvalidSequenceNumber) expected = 0;
+				else expected = m_lastConsumedSequenceNumber + 1;
+
+				if (data->m_sequence != expected)
 				{
-					std::this_thread::sleep_for(std::chrono::milliseconds(1));
-					return;
+					m_semaphoreNextSequence.try_acquire_for(1ms);
+
+					StageThreadContexts();
+
+					index = m_stagedQueue.GetNextIndexFromSequenceNumber();
+
+					if (index == Invalidindex) return; // TODO - all queues are empty, need to sleep until atleast one queue is full
+
+					data = m_stagedQueue.GetData(index);
+
+					// If the next Sequence has failed to arrive within the grace period
+					// the consumer abondons strict ordering for this sequence
+					// rather than stalling the consumer indefintely
 				}
 
-				if (m_stagedQueue.m_stagedData[index].m_sequence != InvalidSequenceNumber)
+				for (auto sink : m_sinks)
 				{
-					m_stagedQueue.m_stagedData[index].PrintData();
-					m_stagedQueue.MarkInvalid(index);
+					sink->Consume(*data);
 				}
+
+				m_lastConsumedSequenceNumber.store(data->m_sequence, std::memory_order_release);
+				m_stagedQueue.MarkInvalid(index);
 			}
 
 			inline void RegisterLogQueue()
@@ -201,87 +255,162 @@ namespace Neyrx
 				g_threadContext = &m_loggerState.m_threadContexts[index];
 			}
 
+			void AddSink(ILoggerSink* InSink)
+			{
+				m_sinks.push_back(InSink);
+			}
+
+			bool IsIdle() const
+			{
+				for (const auto& context : m_loggerState.m_threadContexts)
+				{
+					if (!context.m_logBuffer.IsEmpty())
+					{
+						return false;
+					}
+				}
+				return true;
+			}
+
+			int GetSkippedCount()
+			{
+				return m_skippedLogs.load(std::memory_order_relaxed);
+			}
+
 		private:
 			struct ThreadContext
 			{
 				ThreadContext() : m_logBuffer() {}
 
-				SPSCRingBuffer<LogData, 10> m_logBuffer;
-				std::atomic<uint64_t> InflightSequenceNumber = InvalidSequenceNumber;
+				SPSCRingBuffer<LogData, 128> m_logBuffer;
 			};
 
 			// Staged Queue Fronts corresponding to each thread context in the order of their respective index,
 			// This is used to determine the next queue to consume from
 			struct StagedQueue
 			{
-				public:
-					// Constructor
-					StagedQueue() : m_stagedData() {}
+			public:
+				// Constructor
+				StagedQueue() : m_stagedData() {}
 
-					// Member Functions
+				// Member Functions
 
-					void StageData(LogData InData, size_t InIndex)
+				void StageData(LogData InData, size_t InIndex)
+				{
+					if (InIndex >= m_stagedData.size())
 					{
-						if (InIndex >= m_stagedData.size())
+						std::cerr << "Invalid index for staging data." << std::endl;
+						return;
+					}
+
+					m_stagedData[InIndex] = std::move(InData);
+				}
+
+				const std::chrono::system_clock::time_point GetOldestStagedTime()
+				{
+					auto time = std::chrono::system_clock::now();
+
+					for (std::size_t i = 0; i < m_stagedData.size(); ++i)
+					{
+						if (m_stagedData[i].m_time < time)
 						{
-							std::cerr << "Invalid index for staging data." << std::endl;
-							return;
+							time = m_stagedData[i].m_time;
 						}
-						m_stagedData[InIndex] = std::move(InData);
 					}
 
-					const std::size_t GetNextQueueIndexFromSequence() const
-					{
-						uint64_t minSequence = InvalidSequenceNumber;
-						size_t minIndex = Invalidindex;
+					return time;
+				}
 
-						for (size_t i = 0; i < m_stagedData.size(); ++i)
+				const std::size_t GetNextIndexFromSequenceNumber()
+				{
+					uint64_t minSequenceNumber = InvalidSequenceNumber;
+					std::size_t nextIndex = Invalidindex;
+
+					for (std::size_t i = 0; i < m_stagedData.size(); ++i)
+					{
+						if (m_stagedData[i].m_sequence == InvalidSequenceNumber) continue;
+
+						if (m_stagedData[i].m_sequence < minSequenceNumber)
 						{
-							TRACE(m_stagedData[i].m_sequence, "SEQUENCE For Thread OUT LOOP");
-							if (m_stagedData[i].m_sequence < minSequence)
-							{
-								TRACE(m_stagedData[i].m_sequence, "SEQUENCE For Thread IN LOOP");
-								minSequence = m_stagedData[i].m_sequence;
-								minIndex = i;
-							}
+							minSequenceNumber = m_stagedData[i].m_sequence;
+							nextIndex = i;
 						}
-
-						return minIndex;
 					}
 
-					bool IsInvalid(uint64_t Index) const
+					return nextIndex;
+				}
+
+				bool IsValidQueueIndex(std::size_t Index)
+				{
+					return (Index >= 0 && Index < m_numberOfThreads);
+				}
+
+				bool IsInvalidSequence(uint64_t Index) const
+				{
+					return m_stagedData[Index].m_sequence == InvalidSequenceNumber;
+				}
+
+				void MarkInvalid(uint64_t Index)
+				{
+					assert(Index < m_stagedData.size() && "Index out of bounds");
+					m_stagedData[Index].m_sequence = InvalidSequenceNumber;
+				}
+
+				LogData* GetData(std::size_t Index)
+				{
+					return &m_stagedData[Index];
+				}
+
+				bool IsStageEmpty()
+				{
+					bool result = true;
+
+					for (auto data : m_stagedData)
 					{
-						return m_stagedData[Index].m_sequence == InvalidSequenceNumber;
+						if (data.m_sequence != InvalidSequenceNumber)
+						{
+							result = false;
+						}
 					}
 
-					void MarkInvalid(uint64_t Index)
-					{
-						assert(Index < m_stagedData.size() && "Index out of bounds");
-						m_stagedData[Index].m_sequence = InvalidSequenceNumber;
-					}
+					return result;
+				}
 
-				std::array<LogData, 4> m_stagedData;
+				std::array<LogData, m_numberOfThreads> m_stagedData;
 			};
 
 			struct LoggerState
 			{
 				LoggerState() {}
 
-				std::array<ThreadContext, 4> m_threadContexts;
+				std::array<ThreadContext, m_numberOfThreads> m_threadContexts;
+
+				bool IsValidThreadIndex(std::size_t Index)
+				{
+					return Index >= 0 && Index < m_numberOfThreads;
+				}
 			};
 
 			LoggerState m_loggerState;
 			inline static thread_local ThreadContext* g_threadContext;
-			std::atomic<size_t> m_QueueIndex {0};
+			std::atomic<size_t> m_QueueIndex{ 0 };
 			const size_t m_MaxQueueCount = 4;
 
 			std::atomic<uint64_t> m_globalSequenceNumber{ 0 };
-			std::size_t m_lastConsumedSequenceNumber = 0;
+			std::atomic<uint64_t> m_lastConsumedSequenceNumber = InvalidSequenceNumber;
+			std::counting_semaphore<1> m_semaphoreNextSequence;
 			StagedQueue m_stagedQueue;
+
+			std::atomic<int> m_skippedLogs{ 0 };
+
+			std::vector<ILoggerSink*> m_sinks;
 
 		} NX_Logger;
 	}
 };
+
+
+
 
 #define NX_LOG_INFO Neyrx::Logger::LogLevel::Info
 #define NX_LOG_WARNING Neyrx::Logger::LogLevel::Warning
