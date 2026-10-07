@@ -157,15 +157,37 @@ namespace Neyrx
 			// Member Functions
 			inline void QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string InMsg)
 			{
+				auto startTime = std::chrono::steady_clock::now();
 				uint64_t sequenceNumber = m_globalSequenceNumber.fetch_add(1, std::memory_order_relaxed);
 
 				if (!g_threadContext->m_logBuffer.IsFull())
 				{
-					g_threadContext->m_logBuffer.Enqueue(LogData(InLevel, InCategory, InMsg, sequenceNumber));
-
-					if (sequenceNumber == m_lastConsumedSequenceNumber.load(std::memory_order_relaxed) + 1)
+					if (!g_threadContext->m_logBuffer.Enqueue(LogData(InLevel, InCategory, InMsg, sequenceNumber)))
 					{
-						m_semaphoreNextSequence.release();
+						std::cout << "\nEnqueue Failed\n" << std::endl;
+						return;
+					}
+
+					std::atomic_thread_fence(std::memory_order_acquire);
+
+					auto endTime = std::chrono::steady_clock::now();
+					auto systemTime = std::chrono::system_clock::now();
+
+					auto duration = endTime - startTime;
+
+					if (duration > 300us)
+					{
+						std::cout << "\nEnqueue Message time: " << systemTime << " for Sequence: "<<  sequenceNumber <<std::endl;
+						std::cout << "\nEnqueue Message duration exceeded 100 us. Total duration: " << duration << std::endl;
+					}
+
+					if (m_lastConsumedSequenceNumber != InvalidSequenceNumber)
+					{
+						if (sequenceNumber == m_lastConsumedSequenceNumber.load(std::memory_order_acquire) + 1)
+						{
+							m_semaphoreNextSequence.release();
+							//std::cout << "\nEnqueue semaphore release for : " << sequenceNumber << std::endl;
+						}
 					}
 				}
 				else
@@ -220,7 +242,9 @@ namespace Neyrx
 
 				if (data->m_sequence != expected)
 				{
-					m_semaphoreNextSequence.try_acquire_for(1ms);
+					std::this_thread::sleep_for(1ms);
+
+					bool sema = m_semaphoreNextSequence.try_acquire_for(100ns);
 
 					StageThreadContexts();
 
@@ -229,6 +253,28 @@ namespace Neyrx
 					if (index == Invalidindex) return; // TODO - all queues are empty, need to sleep until atleast one queue is full
 
 					data = m_stagedQueue.GetData(index);
+					//auto time = std::chrono::system_clock::now();
+					//std::cout << "\nconsumer time of stage get: " << time << " for sequence: " << data->m_sequence << ", expected Sequence: "<< expected << std::endl;
+
+					if (sema && data->m_sequence != expected)
+					{
+						//std::cout << "\nsemaphore acquired for sequence number" << expected << "\n";
+						//std::cout << "Next Sequence not found" << std::endl;
+
+						StageThreadContexts();
+
+						index = m_stagedQueue.GetNextIndexFromSequenceNumber();
+
+						if (index == Invalidindex) return; // TODO - all queues are empty, need to sleep until atleast one queue is full
+
+
+						data = m_stagedQueue.GetData(index);
+					}
+
+					if (data->m_sequence != expected)
+					{
+						std::cout << "\nNext Sequence not found\n" << std::endl;
+					}
 
 					// If the next Sequence has failed to arrive within the grace period
 					// the consumer abondons strict ordering for this sequence
@@ -328,8 +374,6 @@ namespace Neyrx
 
 					for (std::size_t i = 0; i < m_stagedData.size(); ++i)
 					{
-						if (m_stagedData[i].m_sequence == InvalidSequenceNumber) continue;
-
 						if (m_stagedData[i].m_sequence < minSequenceNumber)
 						{
 							minSequenceNumber = m_stagedData[i].m_sequence;
@@ -388,6 +432,22 @@ namespace Neyrx
 				bool IsValidThreadIndex(std::size_t Index)
 				{
 					return Index >= 0 && Index < m_numberOfThreads;
+				}
+
+				const std::size_t GetThreadIndex() const
+				{
+					std::size_t index = Invalidindex;
+
+					for (std::size_t i = 0; i < m_threadContexts.size(); ++i)
+					{
+						if (&m_threadContexts[i] == g_threadContext)
+						{
+							index = i;
+							break;
+						}
+					}
+
+					return index;
 				}
 			};
 

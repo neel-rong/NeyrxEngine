@@ -139,5 +139,7 @@ int main()
 		std::cout << "\nSkipped Count" << testSink.GetSkippedCount() << std::endl;
 	}
 
+	getch();
+
 	return 0;
 }
