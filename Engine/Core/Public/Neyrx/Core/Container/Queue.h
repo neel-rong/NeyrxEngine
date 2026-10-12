@@ -8,17 +8,181 @@
 
 namespace Neyrx
 {
+	// ==========================================================
+	// RingBuffer Iterator
+	// ==========================================================
+	template <typename RingBuffer>
+	class RingBufferIterator
+	{
+	public:
+
+		using ValueType		= typename RingBuffer::ValueType;
+		using PointerType	= ValueType*;
+		using ReferenceType = ValueType&;
+
+
+	public:
+
+		RingBufferIterator(PointerType Pointer, std::size_t Head, std::size_t Index, std::size_t Capacity) :
+			m_ptr(Pointer),
+			m_head(Head),
+			m_index(Index),
+			m_capacity(Capacity) { }
+
+		RingBufferIterator& operator++()
+		{
+			++m_index;
+
+			return *this;
+		}
+
+		RingBufferIterator operator++(int)
+		{
+			RingBufferIterator iterator = *this;
+			++(*this);
+
+			return iterator;
+
+		}
+
+		RingBufferIterator& operator--()
+		{
+			assert(m_index > 0);
+			--m_index;
+
+			return *this;
+		}
+
+		RingBufferIterator operator--(int)
+		{
+			RingBufferIterator iterator = *this;
+			--(*this);
+
+			return iterator;
+
+		}
+
+		RingBufferIterator operator+(std::size_t Offset) const
+		{
+			RingBufferIterator iterator = *this;
+			iterator.m_index += Offset;
+
+			return iterator;
+		}
+
+		RingBufferIterator operator-(std::size_t Offset) const
+		{
+			assert(Offset <= m_index);
+
+			RingBufferIterator iterator = *this;
+			iterator.m_index -= Offset;
+
+			return iterator;
+		}
+
+		RingBufferIterator& operator+=(std::size_t Offset)
+		{
+			m_index += Offset;
+
+			return *this;
+		}
+
+		RingBufferIterator& operator-=(std::size_t Offset)
+		{
+			assert(Offset <= m_index);
+			m_index -= Offset;
+
+			return *this;
+		}
+
+		ReferenceType operator[](std::size_t Index) const
+		{
+			return m_ptr[(m_head + m_index + Index) % m_capacity];
+		}
+
+		PointerType operator->() const
+		{
+			return &m_ptr[(m_head + m_index) % m_capacity];
+		}
+
+		ReferenceType operator*() const
+		{
+			return m_ptr[(m_head + m_index) % m_capacity];
+		}
+
+		bool operator==(const RingBufferIterator& Other) const
+		{
+			return m_ptr == Other.m_ptr &&
+					m_head == Other.m_head &&
+					m_index == Other.m_index;
+		}
+
+		bool operator!=(const RingBufferIterator& Other) const
+		{
+			return !(*this == Other);
+		}
+
+		std::size_t GetIndex()
+		{
+			return m_index;
+		}
+
+	private:
+		PointerType m_ptr = nullptr;	// Physical Storage
+		std::size_t m_head = 0;			// Physical Location of Logical 0
+		std::size_t m_index = 0;		// Logical Iterator Position
+		std::size_t m_capacity = 0;		// Physical Capacity
+	};
+
+
+	// ==========================================================
 	// Standard Ringbuffer
+	// ==========================================================
 	template<typename T, std::size_t Capacity>
 	struct RingBuffer
 	{
-		// Returns the Front Logical Index
+	public:
+		using ValueType = T;
+		using Iterator = RingBufferIterator<RingBuffer<T, Capacity>>;
+
+	public:
+		T& operator[](std::size_t Index)
+		{
+			assert(Index < GetSize());
+			return m_data[(m_head + Index) % Capacity];
+		}
+
+		const T& operator[](std::size_t Index) const
+		{
+			assert(Index < GetSize());
+			return m_data[(m_head + Index) % Capacity];
+		}
+
+		Iterator begin()
+		{
+			return Iterator(m_data.data(),
+				m_head,
+				0,
+				Capacity);
+		}
+
+		Iterator end()
+		{
+			return Iterator(m_data.data(),
+				m_head,
+				GetSize(),
+				Capacity);
+		}
+
+
+	public:
+		// Returns the Front Physical Index
 		std::size_t FrontIndex() const
 		{
 			return m_head;
 		}
 
-		// Returns the Back Logical Index
+		// Returns the Back Physical Index
 		std::size_t BackIndex() const
 		{
 			return (m_tail + Capacity - 1) % Capacity;
@@ -38,28 +202,28 @@ namespace Neyrx
 			return m_data[Index];
 		}
 
-		// Returns the Object by reference at the Front Logical Index of the Buffer
+		// Returns the Object by reference at the Front Index of the Buffer
 		T& Front()
 		{
 			assert(!IsEmpty());	// TODO - Error Handling
 			return m_data[m_head];
 		}
 
-		// Returns the Object by const reference at the Front Logical Index of the Buffer
+		// Returns the Object by const reference at the Front Index of the Buffer
 		const T& Front() const
 		{
 			assert(!IsEmpty());	// TODO - Error Handling
 			return m_data[m_head];
 		}
 
-		// Returns the Object by reference at the Back Logical Index of the Buffer
+		// Returns the Object by reference at the Back Index of the Buffer
 		T& Back()
 		{
 			assert(!IsEmpty());	// TODO - Error Handling
 			return m_data[BackIndex()];
 		}
 
-		// Returns the Object by const reference at the Back Logical Index of the Buffer
+		// Returns the Object by const reference at the Back Index of the Buffer
 		const T& Back() const
 		{
 			assert(!IsEmpty());	// TODO - Error Handling
@@ -79,13 +243,15 @@ namespace Neyrx
 		}
 
 		// Copies an LValue in the Queue
-		void Enqueue(const T& InObject)
+		bool Enqueue(const T& InObject)
 		{
-			if (IsFull()) return;
+			if (IsFull()) return false;
 
 			m_data[m_tail] = InObject;
 
 			m_tail = (m_tail + 1) % Capacity;
+
+			return true;
 		}
 
 		// Moves an RValue in to the Queue
@@ -104,9 +270,29 @@ namespace Neyrx
 		{
 			if (IsEmpty()) return false;
 
+			// TODO - Use Trivially destructible
+
 			m_head = (m_head + 1) % Capacity;
 
 			return true;
+		}
+
+		// Returns a const reference to the Logical Index of the Buffer
+		const T& Peek(std::size_t Index) const
+		{
+			assert(Index > 0 && Index < GetSize());
+
+			return m_data[LogicalIndexToPhysicalIndex(Index)];
+		}
+
+		std::size_t LogicalIndexToPhysicalIndex(std::size_t Index)
+		{
+			return (m_head + Index) % Capacity;
+		}
+
+		std::size_t GetSize() const
+		{
+			return (m_tail + Capacity - m_head) % Capacity;
 		}
 
 	private:
@@ -127,6 +313,30 @@ namespace Neyrx
 	struct SPSCRingBuffer
 	{
 	public:
+
+		using ValueType = T;
+		using Iterator = RingBufferIterator<SPSCRingBuffer<T, Capacity>>;
+
+	public:
+
+		Iterator begin()
+		{
+			return Iterator(
+				m_data.data(),
+				m_head.load(std::memory_order_relaxed),
+				0,
+				Capacity
+			);
+		}
+
+		Iterator end()
+		{
+			return Iterator(m_data.data(),
+				m_head.load(std::memory_order_relaxed),
+				GetSize(),
+				Capacity
+			);
+		}
 
 		// Returns true if the Queue is Full, false otherwise
 		bool IsFull() const
@@ -189,6 +399,24 @@ namespace Neyrx
 			m_head.store(next, std::memory_order_release);
 
 			return true;
+		}
+
+		// Returns a const reference to the Logical Index of the Buffer
+		const T& Peek(std::size_t Index) const
+		{
+			assert(Index > 0 && Index < GetSize());
+
+			return m_data[LogicalIndexToPhysicalIndex(Index)];
+		}
+
+		std::size_t LogicalIndexToPhysicalIndex(std::size_t Index)
+		{
+			return (m_head + Index) % Capacity;
+		}
+
+		std::size_t GetSize() const
+		{
+			return (m_tail.load(std::memory_order_acquire) + Capacity - m_head.load(std::memory_order_relaxed)) % Capacity;
 		}
 
 	private:
