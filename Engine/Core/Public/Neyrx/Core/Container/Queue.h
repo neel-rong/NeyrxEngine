@@ -278,6 +278,13 @@ namespace Neyrx
 		}
 
 		// Returns a const reference to the Logical Index of the Buffer
+		T& Peek(std::size_t Index)
+		{
+			assert(Index > 0 && Index < GetSize());
+
+			return m_data[LogicalIndexToPhysicalIndex(Index)];
+		}
+
 		const T& Peek(std::size_t Index) const
 		{
 			assert(Index > 0 && Index < GetSize());
@@ -336,6 +343,13 @@ namespace Neyrx
 				GetSize(),
 				Capacity
 			);
+		}
+	public:
+
+		// Returns the Front Physical Index
+		std::size_t FrontIndex() const
+		{
+			return m_head.load(std::memory_order_relaxed);
 		}
 
 		// Returns true if the Queue is Full, false otherwise
@@ -401,15 +415,40 @@ namespace Neyrx
 			return true;
 		}
 
+		// Moves the front object into the OutObject and increments the Head to release the index at the Front of the Queue
+		// Returns true if the object was successfully dequeued, false if the queue is empty
+		bool Dequeue()
+		{
+			std::size_t head = m_head.load(std::memory_order_relaxed);
+
+			if (head == m_tail.load(std::memory_order_acquire))
+			{
+				//std::cout << "\nQueue is empty, cannot dequeue object.\n";
+				return false; // TODO - TEMP
+			}
+
+			auto next = (head + 1) % Capacity;
+			m_head.store(next, std::memory_order_release);
+
+			return true;
+		}
+
 		// Returns a const reference to the Logical Index of the Buffer
-		const T& Peek(std::size_t Index) const
+		T& Peek(std::size_t Index) const
 		{
 			assert(Index > 0 && Index < GetSize());
 
 			return m_data[LogicalIndexToPhysicalIndex(Index)];
 		}
 
-		std::size_t LogicalIndexToPhysicalIndex(std::size_t Index)
+		const T& Peek(std::size_t Index)
+		{
+			assert(Index > 0 && Index < GetSize());
+
+			return m_data[LogicalIndexToPhysicalIndex(Index)];
+		}
+
+		std::size_t LogicalIndexToPhysicalIndex(std::size_t Index) const
 		{
 			return (m_head + Index) % Capacity;
 		}

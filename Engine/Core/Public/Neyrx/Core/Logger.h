@@ -134,7 +134,7 @@ namespace Neyrx
 		public:
 			virtual ~ILoggerSink() = default;
 
-			virtual void Consume(const LogData& InLogData) = 0;
+			virtual void Consume(const LogData InLogData) = 0;
 		};
 
 
@@ -142,18 +142,23 @@ namespace Neyrx
 		{
 		public:
 			virtual ~IConsoleSink() = default;
-			inline virtual void Consume(const LogData& InLogData) override
+			inline virtual void Consume(const LogData InLogData) override
 			{
 				InLogData.PrintData();
 			}
 		};
 
 
-		static class LoggerClass
+		class LoggerClass
 		{
 		public:
 
 			LoggerClass() : m_loggerState(), m_semaphoreNextSequence(0) {}
+
+			void Initialize()
+			{
+				m_orderedWindow.Initialize(&m_loggerState);
+			}
 
 			// Member Functions
 			inline void QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string InMsg)
@@ -171,6 +176,73 @@ namespace Neyrx
 
 			inline void ConsumeMessage()
 			{
+				m_orderedWindow.ReserveOrderedLogSlots();
+				bool bThisPassFinished = false;
+
+				auto& tracked = m_orderedWindow.GetTrackedSequenceNumbers();
+				bool bMissing = false;
+
+				// Assign ConsumeEndSequenceThisPass equal to ConsumeStartSequenceThisPass only when the values are uninitialized
+				// else, the start value is assinged at start of function, while end is a persistent state managed at the end of function
+				ConsumeStartSequenceThisPass = tracked.Begin;
+				if (ConsumeEndSequenceThisPass == InvalidSequenceNumber)
+				{
+					ConsumeEndSequenceThisPass = ConsumeStartSequenceThisPass;
+				}
+
+				if (m_orderedWindow.UpdateOrderedLog(false))
+				{
+					bMissing = m_orderedWindow.IsSequencesMissing();
+					uint64_t missingSeq = InvalidSequenceNumber;
+
+					if (bMissing)
+					{
+						missingSeq = m_orderedWindow.GetOldestMissingSequenceAfter(ConsumeEndSequenceThisPass);
+						if (missingSeq != InvalidSequenceNumber)
+						{
+							ConsumeEndSequenceThisPass = missingSeq - 1;
+						}
+					}
+					else
+					{
+						ConsumeEndSequenceThisPass = m_orderedWindow.GetLastReservedSequence();
+					}
+
+					for (auto sink : m_sinks)
+					{
+						if (m_orderedWindow.Flush(ConsumeStartSequenceThisPass, ConsumeEndSequenceThisPass, *sink))
+						{
+							ConsumeStartSequenceThisPass = tracked.Begin;
+						}
+					}
+
+					if (bMissing)
+					{
+						const LogSlot* oldestValidSlot = m_orderedWindow.GetOldestValidLogSlot();
+						if (oldestValidSlot == nullptr)
+						{
+							std::cout << "Oldest Valid Log Slot returned is NULL" << std::endl;
+							return;
+						}
+						const LogData* oldestValiddata = oldestValidSlot->Data;
+						if (oldestValiddata == nullptr)
+						{
+							std::cout << "Oldest Valid Log Slot Data returned is NULL" << std::endl;
+							return;
+						}
+						if (oldestValiddata->m_sequence < missingSeq)
+						{
+							assert(false && "oldestData is older than missing data after PreGrace flush");
+							return;
+						}
+
+						std::chrono::system_clock::time_point graceStart = oldestValiddata->m_time;
+
+						std::this_thread::sleep_until(graceStart + 1ms);
+					}
+
+					ConsumeEndSequenceThisPass = m_orderedWindow.GetLastReservedSequence();
+				}
 			}
 
 			inline void RegisterLogQueue()
@@ -245,6 +317,10 @@ namespace Neyrx
 			};
 
 
+			// ==================================================
+			// Log Slot
+			// ==================================================
+
 			struct LogSlot
 			{
 				LogSlot() = default;
@@ -269,31 +345,49 @@ namespace Neyrx
 			{
 				struct BufferPosition
 				{
-					std::size_t ChunkIndex = 0;
-					std::size_t Offset = 0;
+					BufferPosition() = default;
+					BufferPosition(std::size_t InChunkIndex, std::size_t InOffset) :
+						ChunkIndex(InChunkIndex),
+						Offset(InOffset) { }
+
+					std::size_t ChunkIndex = Invalidindex;
+					std::size_t Offset = Invalidindex;
+
+					bool IsValid() const
+					{
+						return ChunkIndex <  OrderedLogBufferChunkCount &&
+							Offset < Capacity;
+					}
 				};
 
 
 				// Reserves Capacity(value of) consecutive sequence numbers in the ordered buffer.
+				// TODO - Define Sentinal Number Policy
 				bool ReserveSlots(const uint64_t InStartSequenceNumber)
 				{
 					if (!HasFreeChunk()) return false;										// Not enough capacity to reserve all sequences
+
+					if (InStartSequenceNumber == InvalidSequenceNumber || InvalidSequenceNumber - InStartSequenceNumber < Capacity)
+					{
+						std::cout << "Sequence Number Range exceeds Sentinal Limit";
+						return false;
+					}
 
 					if (OldestReservedSequenceNumber == InvalidSequenceNumber)				// First ReserveSlots function call, no prior ReserveSlots function call was made
 					{
 						OldestReservedSequenceNumber = InStartSequenceNumber;
 					}
-
-					if (InStartSequenceNumber < OldestReservedSequenceNumber) return false; // Stale logs should bypass the Ordered Window
-
 					// Do not reserve Sequences that are already reserved, or leaves a gap with last reserved sequence number
-					if (InStartSequenceNumber != OldestReservedSequenceNumber + GetSize()) return false;
-
+					else
+					{
+						if (InStartSequenceNumber != OldestReservedSequenceNumber + GetSize()) return false;
+					}
+					uint64_t sequence = InvalidSequenceNumber;
 					// Reserves Capacity(value of) consecutive sequence numbers in the ordered buffer.
 					// Reservations continue from BufferWriteCursor, the next physical write
 					// position. A full chunk advances the cursor to the next chunk at offset 0.
 					// The next chunk must be empty before it can be used.
-					for (std::size_t i = 0; i < Capacity; ++i)						// No more than single chunks capacity should be reserved during a pass
+					for (std::size_t i = 0; i < Capacity;++i)						// No more than single chunks capacity should be reserved during a pass
 					{
 						if (BufferWriteCursor.Offset >= Capacity)					// If the present chunk is full, move to the next chunk
 						{
@@ -304,10 +398,72 @@ namespace Neyrx
 							BufferWriteCursor.Offset = 0;
 						}
 
-						uint64_t sequence = InStartSequenceNumber + static_cast<uint64_t>(i);
+						sequence = InStartSequenceNumber + static_cast<uint64_t>(i);
 						OrderedLogBuffers[BufferWriteCursor.ChunkIndex][BufferWriteCursor.Offset].SequenceNumber = sequence;
 						++BufferWriteCursor.Offset;
 						++BufferSize[BufferWriteCursor.ChunkIndex];
+					}
+
+					if (sequence != InvalidSequenceNumber)
+					{
+						LastReservedSequenceNumber = sequence;
+					}
+
+					return true;
+				}
+
+				bool DereserveSequences(uint64_t StartSequence, uint64_t EndSequence)
+				{
+					if (EndSequence == InvalidSequenceNumber || StartSequence == InvalidSequenceNumber ||
+						StartSequence > EndSequence || StartSequence != OldestReservedSequenceNumber)	// TODO - Error Handling
+					{
+						std::cout << "Invalid Start or End Sequence" << std::endl;
+						return false;
+					}
+
+					std::size_t size = GetSize();		// If later Dereserve Is more linient in respect of StartSequence this will be useful
+					std::size_t offset = StartSequence - OldestReservedSequenceNumber;
+					std::size_t count = EndSequence - StartSequence + 1;
+
+					if (offset >= size || offset + count > size)
+					{
+						std::cout << "Sequences Out of Range" << std::endl;
+						return false;
+					}
+
+					BufferPosition bufPos = GetBufferPosition(StartSequence);
+
+					if (!bufPos.IsValid()) return false;
+
+					for (uint64_t seq = StartSequence;; ++seq)
+					{
+						LogSlot& slot = OrderedLogBuffers[bufPos.ChunkIndex][bufPos.Offset];
+
+						assert(slot.SequenceNumber == seq && "Unexpected Sequence Number in Reserved Slot");
+
+						const std::size_t slotChunkIndex = bufPos.ChunkIndex;
+
+						slot.SequenceNumber = InvalidSequenceNumber;
+						slot.Data = nullptr;
+
+						assert(BufferSize[slotChunkIndex] > 0);
+						--BufferSize[slotChunkIndex];
+
+						IncrementBufferPosition(BufferIndexStart);
+						IncrementBufferPosition(bufPos);
+
+						if (seq == EndSequence) break;
+					}
+
+					if (IsEmpty())
+					{
+						OldestReservedSequenceNumber = InvalidSequenceNumber;
+						BufferIndexStart = BufferPosition{ 0, 0 };
+						BufferWriteCursor = BufferPosition{ 0, 0 };
+					}
+					else
+					{
+						OldestReservedSequenceNumber = EndSequence + 1;
 					}
 
 					return true;
@@ -315,18 +471,29 @@ namespace Neyrx
 
 				LogSlot* GetReservedSlot(const uint64_t InSequenceNumber)
 				{
+					BufferPosition bpos = GetBufferPosition(InSequenceNumber);
+
+					if (!bpos.IsValid()) return nullptr;
+
+					LogSlot* slot = &OrderedLogBuffers[bpos.ChunkIndex][bpos.Offset];
+
+					return slot;
+				}
+
+				BufferPosition GetBufferPosition(const uint64_t InSequenceNumber)
+				{
 					// Return null if the buffer is empty, or no reserve functional call has been made yet
-					if (IsEmpty() || OldestReservedSequenceNumber == InvalidSequenceNumber) return nullptr;
+					if (IsEmpty() || OldestReservedSequenceNumber == InvalidSequenceNumber) return BufferPosition();
 
 					// Return null if InSequenceNumber is a stale sequence number
-					if (InSequenceNumber < OldestReservedSequenceNumber) return nullptr;
+					if (InSequenceNumber < OldestReservedSequenceNumber) return BufferPosition();
 
 					std::size_t totalBufferSize = GetSize();
 
 					uint64_t sequenceOffset = InSequenceNumber - OldestReservedSequenceNumber;
 
 					// Return null if InSequenceNumber is not within reserved range
-					if (sequenceOffset >= totalBufferSize) return nullptr;
+					if (sequenceOffset >= totalBufferSize) return BufferPosition();
 
 					const std::size_t offset = static_cast<std::size_t>(sequenceOffset);
 
@@ -341,9 +508,7 @@ namespace Neyrx
 						cindex = (BufferIndexStart.ChunkIndex + chunkAdvance) % OrderedLogBufferChunkCount;
 					}
 
-					LogSlot* slot = &OrderedLogBuffers[cindex][bindex];
-
-					return slot->SequenceNumber == InSequenceNumber ? slot : nullptr;
+					return BufferPosition(cindex, bindex);
 				}
 
 				// Returns ture if the present write chunk or the next chunk is empty
@@ -384,54 +549,116 @@ namespace Neyrx
 					return GetSize() == 0;
 				}
 
+				void IncrementBufferPosition(BufferPosition& InBufferPosition)
+				{
+					++InBufferPosition.Offset;
+
+					if (InBufferPosition.Offset >= Capacity)
+					{
+						InBufferPosition.ChunkIndex = (InBufferPosition.ChunkIndex + 1) % OrderedLogBufferChunkCount;
+						InBufferPosition.Offset = 0;
+					}
+				}
+
+				const uint64_t GetOldestReservedSequenceNumber() const
+				{
+					return OldestReservedSequenceNumber;
+				}
+
+				const uint64_t GetLastReservedSequenceNumber() const
+				{
+					return LastReservedSequenceNumber;
+				}
+
 				// Member Parameters
 				static constexpr std::size_t OrderedLogBufferChunkCount = 3;
 
 				std::array<std::array <LogSlot, Capacity>, OrderedLogBufferChunkCount> OrderedLogBuffers { };
 
-				BufferPosition BufferIndexStart { };		// Physical position of the oldest live reserved slot.
-				BufferPosition BufferWriteCursor { };			// Physical position of the next slot to reserve.
+				BufferPosition BufferIndexStart{0 ,0 };		// Physical position of the oldest live reserved slot.
+				BufferPosition BufferWriteCursor{0, 0};			// Physical position of the next slot to reserve.
 				std::array<std::size_t, OrderedLogBufferChunkCount> BufferSize { };	// The present size of each buffer
 
 				// Sequence number corresponding to BufferIndexStart.
 				// Advances when the oldest reserved slots are removed.
 				// Retains its last value when the buffer becomes empty.
-				uint64_t OldestReservedSequenceNumber = InvalidSequenceNumber;
+				uint64_t OldestReservedSequenceNumber = InvalidSequenceNumber;	// Denotes the actual reserved oldest sequnce. Set to invalid Sequnce Number when nothing is reserved
+				uint64_t LastReservedSequenceNumber = InvalidSequenceNumber;	// Denotes the last reserved sequence number. Retains the value even if nothing is stored.
 			};
 
 
-			// ===========================================================================================
+
+
+			// =======================================================================================================================================
 			// Ordered Window
+			// =======================================================================================================================================
 			template<std::size_t Capacity>
 			struct OrderedWindow
 			{
 			public:
 
-				OrderedWindow(LoggerState* InLoggerState, uint64_t* InLastConsumedSequence) :
-					m_loggerStatePointer(InLoggerState),
-					m_lastConsumedSequence(InLastConsumedSequence)
+				OrderedWindow() {}
+
+				void Initialize(LoggerState* InLoggerState)
 				{
+					m_loggerStatePointer = InLoggerState;
 					m_missingSequences.reserve(Capacity / 2);
 				}
 
+				struct TrackedSequenceNumbers
+				{
+					uint64_t Begin = InvalidSequenceNumber;
+					uint64_t End = InvalidSequenceNumber;
+				};
+
 				bool ReserveOrderedLogSlots()
 				{
-					return m_orderedLogBuffer.ReserveSlots(m_lastReservedSequence + 1);
+					uint64_t lastRes = m_orderedLogBuffer.GetLastReservedSequenceNumber();
+
+					if (lastRes != InvalidSequenceNumber &&
+						lastRes >= InvalidSequenceNumber - Capacity)		// Sentinal Gaurd
+					{
+						return false;
+					}
+
+					uint64_t startRes = lastRes == InvalidSequenceNumber			// If LastRes is 0, then this is the first function call, use StartRes as 0
+						? 0
+						: lastRes + 1;
+
+					if (!m_orderedLogBuffer.ReserveSlots(startRes)) return false;
+
+					uint64_t oldestRes = m_orderedLogBuffer.GetOldestReservedSequenceNumber();
+
+					if (oldestRes == InvalidSequenceNumber)
+					{
+						m_trackedSequences.Begin = startRes;
+					}
+					else
+					{
+						m_trackedSequences.Begin = oldestRes;
+					}
+
+					m_trackedSequences.End = startRes + Capacity - 1;
+
+					return true;
 				}
 
 				bool UpdateOrderedLog(bool bGracePeriodCheck)
 				{
+					uint64_t oldestSeq = m_orderedLogBuffer.GetOldestReservedSequenceNumber();
+
 					if (!bGracePeriodCheck)
 					{
-						if (m_OldestReservedSequence == InvalidSequenceNumber)
+						// First Update; sequence zero is valid
+						if (oldestSeq == InvalidSequenceNumber)
 						{
-							// First Update; sequence zero is valid
-							m_OldestReservedSequence = 0;
+							return false;	// Nothing is reserved in the OrderedLogBuffer;
 						}
 
-						m_OldestReservedSequenceThisPass = m_lastReservedSequence == InvalidSequenceNumber
+						// First Update; sequence zero is valid
+						m_OldestExpectedSequenceThisPass = m_highestReservedSequence == InvalidSequenceNumber
 							? 0
-							: m_lastReservedSequence + 1;
+							: m_highestReservedSequence + 1;
 					}
 
 
@@ -445,74 +672,108 @@ namespace Neyrx
 
 						for (auto it = buffer.begin(); it != buffer.end(); ++it)
 						{
-							LogData* data = buffer.Peek(it.GetIndex());
+							const LogData* data = &buffer.Peek(it.GetIndex());
+
+							if (data == nullptr)
+							{
+								std::cout << "Data is Null in SPSC Queue" << std::endl;
+								continue;
+							}
+
 							uint64_t seq = data->m_sequence;
 
-							if (seq < m_OldestReservedSequenceThisPass) continue; // Stale sequence use the bypass function
+							if (seq == InvalidSequenceNumber)
+							{
+								std::cout << "INVALID Sequence Number FOUND in Context Queue" << std::endl;
+								continue;
+							}
+
+							if (seq < oldestSeq) continue; // Stale sequence use the bypass function
 
 							// If the sequence is such that it exceeds the max Sequence Number that can be reserved this pass,
 							// break and conitnue with the next thread context.
-							// This thread connot contain a smaller sequence number
-							const uint64_t offset = seq - m_OldestReservedSequenceThisPass;
-							if (offset >= Capacity) break;
+							// This thread context connot contain a smaller sequence number
+							const uint64_t rangeStart = m_OldestExpectedSequenceThisPass == InvalidSequenceNumber ? 0 : m_OldestExpectedSequenceThisPass;
 
-							uint64_t lastconsumed = *m_lastConsumedSequence;
-
-							// If no log has been consumed then use lastconsumed as 0. This results in the index of the incoming 0 sequence being 0.
-							// Otherwise, if lastconsumed > seq, then data is a stale log, and must use the bypass function
-							if (lastconsumed == InvalidSequenceNumber)
+							if (seq > rangeStart)			// seq if not greater than range start, is greater than oldestRserved, and is a missing data. Should bypass this check
 							{
-								lastconsumed = 0;
+								const uint64_t offset = seq - rangeStart;
+								if (offset >= Capacity) break;
 							}
-							else if (m_lastReservedSequence != InvalidSequenceNumber &&	seq < m_lastReservedSequence)
+
+							// If no log has been consumed/reserved then use expected as 0. This results in the index of the incoming sequence passing the threashold.
+							uint64_t expected = m_highestReservedSequence == InvalidSequenceNumber ? 0 : m_highestReservedSequence + 1;
+
+							std::size_t bMissingIndex = Invalidindex;
+
+							// If expected > seq, then check if the seq is found in m_missingSequences
+							// if expected < seq, reserve all Sequence Numbers between expected and seq
+							if (seq < expected)
 							{
 								auto it = std::find(m_missingSequences.begin(), m_missingSequences.end(), seq);
 
 								if (it == m_missingSequences.end())
 								{
-									continue; // If seq is not a missing tracked sequence, the seq has already been reserved in the previous pass and is waiting flush
+									if (bGracePeriodCheck)
+									{
+										continue; // If seq is not a missing tracked sequence, the seq has already been reserved in the previous pass and is waiting flush
+									}
+									else
+									{
+										assert(false && "Reserve Slot and Updated Order Log Bug");
+										continue;
+									}
 								}
 
-								// If seq is a missing sequence, pop the seq from the m_missingSequences
-								auto index = static_cast<std::size_t>(std::distance(m_missingSequences.begin(), it));
-								std::swap(m_missingSequences[index], m_missingSequences.back());
-								m_missingSequences.pop_back();
+								// If seq is a missing sequence, store the index, and pop only if successfully reserved
+								bMissingIndex = static_cast<std::size_t>(std::distance(m_missingSequences.begin(), it));
 							}
-							else if (m_lastReservedSequence == InvalidSequenceNumber || seq > m_lastReservedSequence) // Gaurd against sentinal overflow
+							else if (seq > expected) // Gaurd against sentinal overflow and Sequence Gap
 							{
-								uint64_t expected = m_lastReservedSequence == InvalidSequenceNumber
-									? 0
-									: m_lastReservedSequence + 1;
-
-								// if seq > m_lastReservedSequence + 1 (the expected sequence), mark all in between sequences as missing
+								// if seq > expected, mark all in between sequences as missing
 								// and push back into m_missingSequences
 								if (seq > expected)
 								{
-									for (std::size_t missing = expected; missing < seq; ++missing)
+									for (uint64_t missing = expected; missing < seq; ++missing)
 									{
 										m_missingSequences.push_back(missing);
 									}
 								}
-
-								m_lastReservedSequence = seq;
 							}
 
 							LogSlot* slot = m_orderedLogBuffer.GetReservedSlot(seq);
 
-							assert(slot != nullptr && "Invalid Slot. The Sequence Number was possibly not reserved");
+							if (slot == nullptr)
+							{
+								std::cout << "Invalid Slot. The Sequence Number was possibly not reserved" << std::endl;
+								assert(false);
+								continue;
+							}
 
 
 							// If the slot returned by the LogBuffer, already contains a pointer to valid data,
 							// It is an old or stale data that was not flushed.
 							// The eariler condition statement should have prohinited such conditions to exist
 							// If the asset below is hit, check the validity of condition statements for rejecting sequences first
-							assert(slot->Data == nullptr && "Encountered a reserved slot with valid a data pointer");
-
-							*slot = LogSlot(0, 0, seq, data);
-
-							if (m_lastReservedSequence < seq)
+							if (slot->Data != nullptr)
 							{
-								m_lastReservedSequence = seq;
+								std::cout << "Encountered a reserved slot with valid a data pointer" << std::endl;
+								assert(false);
+								continue;
+							}
+
+							*slot = LogSlot(0, 0, seq, const_cast<LogData*>(data));
+
+							if (m_highestReservedSequence == InvalidSequenceNumber || m_highestReservedSequence < seq)
+							{
+								m_highestReservedSequence = seq;
+							}
+
+							// If seq is a missing index, swap and pop from m_missingSequences
+							if (bMissingIndex != Invalidindex)
+							{
+								std::swap(m_missingSequences[bMissingIndex], m_missingSequences.back());
+								m_missingSequences.pop_back();
 							}
 
 							bUpdated = true;
@@ -522,20 +783,146 @@ namespace Neyrx
 					return bUpdated;
 				}
 
+				const LogSlot* GetOldestValidLogSlot()
+				{
+					for (uint64_t i = m_trackedSequences.Begin; i <= m_trackedSequences.End; ++i)
+					{
+						if (std::find(m_missingSequences.begin(), m_missingSequences.end(), i) != m_missingSequences.end())
+						{
+							LogSlot* slot = m_orderedLogBuffer.GetReservedSlot(i);
+							if (slot != nullptr) return slot;
+						}
+					}
+
+					return nullptr;
+				}
+
+				const LogSlot* GetTrackedSlot(uint64_t SequenceNumber)
+				{
+					return m_orderedLogBuffer.GetReservedSlot(SequenceNumber);
+				}
+
+				bool IsSequencesMissing()
+				{
+					return m_missingSequences.size() > 0;
+				}
+
+				uint64_t GetOldestMissingSequenceAfter(uint64_t SequenceNumber)
+				{
+					uint64_t missingSeq = InvalidSequenceNumber;
+					for (auto mis : m_missingSequences)
+					{
+						if (mis > SequenceNumber)
+						{
+							missingSeq = std::min(missingSeq, mis);
+						}
+					}
+
+					return missingSeq;
+				}
+
+				uint64_t GetLastReservedSequence()
+				{
+					return m_orderedLogBuffer.GetLastReservedSequenceNumber();
+				}
+
+				const TrackedSequenceNumbers& GetTrackedSequenceNumbers() const
+				{
+					return m_trackedSequences;
+				}
+
+				bool Flush(uint64_t StartSequenceNumber, uint64_t EndSequenceNumber, ILoggerSink& Sink)
+				{
+					assert((EndSequenceNumber < InvalidSequenceNumber &&
+						StartSequenceNumber < InvalidSequenceNumber &&
+						StartSequenceNumber <= EndSequenceNumber) && "Invalid Start or End Sequence");
+
+					bool bFlushed = false;
+
+					for (uint64_t seq = StartSequenceNumber; seq <= EndSequenceNumber; ++seq)
+					{
+						LogSlot* slot = m_orderedLogBuffer.GetReservedSlot(seq);
+						if (slot == nullptr)
+						{
+							std::cout << "Reserved Slot NOT FOUND for Seq: " << seq << std::endl;
+							continue;
+						}
+
+						LogData* data = slot->Data;
+						if (data == nullptr)
+						{
+							MissingDataTemplate.m_sequence = seq;
+							data = &MissingDataTemplate;
+							std::cout << "LOG DATA POINTER FOR SEQ: " << seq << " is a NULL_PTR" << std::endl;
+						}
+
+						Sink.Consume(std::move(*data));	// Safe only because consumer is responsible for Sink execution. If later the architecture changes, this needs to be taken into account.
+					}
+
+					for (auto& context : m_loggerStatePointer->m_threadContexts)
+					{
+						auto& logBuffer = context.m_logBuffer;
+
+						while (!logBuffer.IsEmpty())
+						{
+							uint64_t peekSeq = logBuffer.Peek(logBuffer.FrontIndex()).m_sequence;
+
+							if (peekSeq >= StartSequenceNumber && peekSeq <= EndSequenceNumber)
+							{
+								logBuffer.Dequeue();
+								bFlushed = true;
+							}
+							else
+							{
+								break;
+							}
+						}
+					}
+
+					if (m_trackedSequences.Begin != StartSequenceNumber)
+					{
+						std::cout << "ERROR WITH TRACKED SEQUENCES" << std::endl;
+						assert(false);
+					}
+					else if (m_trackedSequences.End == EndSequenceNumber && m_orderedLogBuffer.IsEmpty())
+					{
+						m_trackedSequences.Begin = InvalidSequenceNumber;
+						m_trackedSequences.End = InvalidSequenceNumber;
+					}
+					else if (m_trackedSequences.End < EndSequenceNumber)
+					{
+						m_trackedSequences.Begin = EndSequenceNumber + 1;
+					}
+					else
+					{
+						std::cout << "ERROR WITH TRACKED SEQUENCES" << std::endl;
+						assert(false);
+					}
+
+					if (!m_orderedLogBuffer.DereserveSequences(StartSequenceNumber, EndSequenceNumber))
+					{
+						std::cout << "ERROR WITH DERESERVING SEQUENCES" << std::endl;
+						assert(false);
+					}
+
+					return bFlushed;
+				}
+
 			private:
 
-				LogBuffer<Capacity> m_orderedLogBuffer;
+				OrderedLogBuffer<Capacity> m_orderedLogBuffer;
+				TrackedSequenceNumbers m_trackedSequences;
 
 				std::vector<char> m_Arena;
 				std::vector<uint64_t> m_missingSequences;
 				std::size_t m_cursorStart = 0;
 				std::size_t m_cursorEnd = 0;
-				std::size_t m_lastReservedSequence = InvalidSequenceNumber;
-				uint64_t m_OldestReservedSequenceThisPass = InvalidSequenceNumber;
-				uint64_t m_OldestReservedSequence = InvalidSequenceNumber;
+				uint64_t m_highestReservedSequence = InvalidSequenceNumber;
+				uint64_t m_OldestExpectedSequenceThisPass = InvalidSequenceNumber;
 
 				LoggerState* m_loggerStatePointer = nullptr;
-				uint64_t* m_lastConsumedSequence = nullptr;
+
+				LogData MissingDataTemplate{Neyrx::Logger::LogLevel::Warning, Neyrx::Logger::LogCategory::Temp, "MISSING SEQUENCE NUMBER", 0};
 			};
 
 
@@ -546,6 +933,8 @@ namespace Neyrx
 			std::atomic<size_t> m_QueueIndex{ 0 };
 			const size_t m_MaxQueueCount = 4;
 
+			OrderedWindow<ThreadQueueSize/5> m_orderedWindow;
+
 			std::atomic<uint64_t> m_globalSequenceNumber{ 0 };
 			std::atomic<uint64_t> m_lastConsumedSequenceNumber = InvalidSequenceNumber;
 			std::counting_semaphore<1> m_semaphoreNextSequence;
@@ -554,9 +943,13 @@ namespace Neyrx
 
 			std::vector<ILoggerSink*> m_sinks;
 
-		} NX_Logger;
+			uint64_t ConsumeStartSequenceThisPass = InvalidSequenceNumber;
+			uint64_t ConsumeEndSequenceThisPass = InvalidSequenceNumber;
+		};
 	}
 };
+
+static Neyrx::Logger::LoggerClass NX_Logger;
 
 
 
@@ -568,4 +961,4 @@ namespace Neyrx
 
 #define NX_LOG_TEMP Neyrx::Logger::LogCategory::Temp
 
-#define NX_LOG(CATEGORY, LEVEL, LOGMSG)  Neyrx::Logger::NX_Logger.QueueMessage(CATEGORY, LEVEL, LOGMSG);
+#define NX_LOG(CATEGORY, LEVEL, LOGMSG)  NX_Logger.QueueMessage(CATEGORY, LEVEL, LOGMSG);

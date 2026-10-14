@@ -8,7 +8,7 @@ static std::atomic<bool> StopLog = false;
 class TestSink : public Neyrx::Logger::ILoggerSink
 {
 public:
-    virtual void Consume(const Neyrx::Logger::LogData& InLogData) override
+    virtual void Consume(const Neyrx::Logger::LogData InLogData) override
     {
 		uint64_t sequenceNumber = InLogData.m_sequence;
 
@@ -50,7 +50,7 @@ public:
 
 	int GetSkippedCount()
 	{
-		return Neyrx::Logger::NX_Logger.GetSkippedCount();
+		return NX_Logger.GetSkippedCount();
 	}
 
 private:
@@ -83,15 +83,15 @@ void InputLog(int& count)
 
 void Logger()
 {
-	while (!Neyrx::Logger::NX_Logger.IsIdle() || !StopLog)
+	while (!NX_Logger.IsIdle() || !StopLog)
 	{
-		Neyrx::Logger::NX_Logger.ConsumeMessage();
+		NX_Logger.ConsumeMessage();
 	}
 }
 
 void Worker()
 {
-	Neyrx::Logger::NX_Logger.RegisterLogQueue();
+	NX_Logger.RegisterLogQueue();
 	while (!StopLog)
 	{
 		InputLog(g_msgCount.count);
@@ -104,7 +104,7 @@ int main()
 	std::cout << "Starting Logger Test...\n";
 
 	TestSink testSink;
-	Neyrx::Logger::NX_Logger.AddSink(&testSink);
+	NX_Logger.AddSink(&testSink);
 
 
 	std::thread thread1(Worker);
