@@ -1,5 +1,5 @@
 #include "Neyrx/Core/Container/Queue.h"
-#include "Neyrx/Core/Logger.h"
+#include "Neyrx/Core/Logger/Logger.h"
 #include <conio.h>
 
 
@@ -83,7 +83,8 @@ void InputLog(int& count)
 
 void Logger()
 {
-	while (!NX_Logger.IsIdle() || !StopLog)
+	std::this_thread::sleep_for(2ms);
+	while (!StopLog)
 	{
 		NX_Logger.ConsumeMessage();
 	}
@@ -95,7 +96,7 @@ void Worker()
 	while (!StopLog)
 	{
 		InputLog(g_msgCount.count);
-		std::this_thread::sleep_for(std::chrono::milliseconds(40));
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
 }
 
@@ -103,6 +104,7 @@ int main()
 {
 	std::cout << "Starting Logger Test...\n";
 
+	NX_Logger.Initialize();
 	TestSink testSink;
 	NX_Logger.AddSink(&testSink);
 
@@ -112,9 +114,19 @@ int main()
 	std::thread thread3(Worker);
 	std::thread thread4(Worker);
 
+
 	std::thread thread5(Logger);
 
-	getch();
+	while (!StopLog)
+	{
+		int stop = 0;
+		std::cin >> stop;
+
+		if (stop == 1)
+		{
+			StopLog.store(true, std::memory_order_release);
+		}
+	}
 
 	StopLog = true;
 
@@ -139,7 +151,7 @@ int main()
 		std::cout << "\nSkipped Count" << testSink.GetSkippedCount() << std::endl;
 	}
 
-	getch();
+	std::cin;
 
 	return 0;
 }

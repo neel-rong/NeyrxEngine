@@ -1,7 +1,7 @@
 #include <iostream>
 #include <thread>
 #include "Neyrx/Core/Container/Queue.h"
-#include "Neyrx/Core/Logger.h"
+#include "Neyrx/Core/Logger/Logger.h"
 #include <sstream>
 #include <semaphore>
 

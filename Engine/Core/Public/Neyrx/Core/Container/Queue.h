@@ -11,12 +11,12 @@ namespace Neyrx
 	// ==========================================================
 	// RingBuffer Iterator
 	// ==========================================================
-	template <typename RingBuffer>
+	template <typename RingBufferType>
 	class RingBufferIterator
 	{
 	public:
 
-		using ValueType		= typename RingBuffer::ValueType;
+		using ValueType		= typename RingBufferType::ValueType;
 		using PointerType	= ValueType*;
 		using ReferenceType = ValueType&;
 
@@ -133,6 +133,21 @@ namespace Neyrx
 		std::size_t m_index = 0;		// Logical Iterator Position
 		std::size_t m_capacity = 0;		// Physical Capacity
 	};
+
+
+
+	// ==========================================================
+	// Ringbuffer Iterator Snapshot
+	// ==========================================================
+
+	template <typename RingBufferType>
+	struct RingBufferIteratorSnapshot
+	{
+		RingBufferIterator<RingBufferType> Begin;
+		RingBufferIterator<RingBufferType> End;
+	};
+
+
 
 
 	// ==========================================================
@@ -323,26 +338,20 @@ namespace Neyrx
 
 		using ValueType = T;
 		using Iterator = RingBufferIterator<SPSCRingBuffer<T, Capacity>>;
+		using IteratorSnapshot = RingBufferIteratorSnapshot<SPSCRingBuffer<T, Capacity>>;
 
 	public:
 
-		Iterator begin()
+		IteratorSnapshot GetRingBufferIteratorSnapshot()
 		{
-			return Iterator(
-				m_data.data(),
-				m_head.load(std::memory_order_relaxed),
-				0,
-				Capacity
-			);
-		}
+			const std::size_t head = m_head.load(std::memory_order_relaxed);
+			const std::size_t tail = m_tail.load(std::memory_order_acquire);
+			const std::size_t size = (tail + Capacity - head) % Capacity;
 
-		Iterator end()
-		{
-			return Iterator(m_data.data(),
-				m_head.load(std::memory_order_relaxed),
-				GetSize(),
-				Capacity
-			);
+			return {
+				Iterator(m_data.data(), head, 0, Capacity),
+				Iterator(m_data.data(), head, size, Capacity)
+			};
 		}
 	public:
 
@@ -433,17 +442,39 @@ namespace Neyrx
 			return true;
 		}
 
-		// Returns a const reference to the Logical Index of the Buffer
-		T& Peek(std::size_t Index) const
+		// Takes the physical index and returns the data at the physcial adress
+		T& Peek(std::size_t Index)
 		{
-			assert(Index > 0 && Index < GetSize());
+			if (Index >= Capacity)
+			{
+				assert(Index < Capacity && "Invalid Queue Acess");
+			}
+
+			return m_data[Index];
+		}
+
+		// Takes the physical index and returns the data at the physcial adress
+		const T& Peek(std::size_t Index) const
+		{
+			if (Index >= Capacity)
+			{
+				assert(Index < Capacity && "Invalid Queue Acess");
+			}
+
+			return m_data[Index];
+		}
+
+		// Takes the logical index and returns the data at the physcial adress
+		T& PeekLogical(std::size_t Index)
+		{
+			assert(Index < GetSize());
 
 			return m_data[LogicalIndexToPhysicalIndex(Index)];
 		}
 
-		const T& Peek(std::size_t Index)
+		const T& PeekLogical(std::size_t Index) const
 		{
-			assert(Index > 0 && Index < GetSize());
+			assert(Index < GetSize());
 
 			return m_data[LogicalIndexToPhysicalIndex(Index)];
 		}
