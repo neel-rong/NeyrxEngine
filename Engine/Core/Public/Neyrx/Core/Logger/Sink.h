@@ -1,40 +1,37 @@
 #pragma once
 #include "Neyrx/Core/Logger/LogDataStructures.h"
 
-namespace Neyrx
+namespace Neyrx::Logger
 {
-	namespace Logger
+	// ==========================================================================================================
+	// Logger Sink
+	// ==========================================================================================================
+
+	class ILoggerSink
 	{
-		// ==========================================================================================================
-		// Logger Sink
-		// ==========================================================================================================
+	public:
 
-		class ILoggerSink
+		virtual ~ILoggerSink() = default;
+
+		virtual void Publish(const LogData& InLogData) = 0;
+	};
+
+
+
+
+	// ==========================================================================================================
+	// Console Sink
+	// ==========================================================================================================
+
+	class IConsoleSink : public ILoggerSink
+	{
+	public:
+
+		virtual ~IConsoleSink() = default;
+
+		inline virtual void Publish(const LogData& InLogData) override
 		{
-		public:
-
-			virtual ~ILoggerSink() = default;
-
-			virtual void Publish(const LogData InLogData) = 0;
-		};
-
-
-
-
-		// ==========================================================================================================
-		// Console Sink
-		// ==========================================================================================================
-
-		class IConsoleSink : public ILoggerSink
-		{
-		public:
-
-			virtual ~IConsoleSink() = default;
-
-			inline virtual void Publish(const LogData InLogData) override
-			{
-				InLogData.PrintData();
-			}
-		};
-	}
+			InLogData.PrintData();
+		}
+	};
 }

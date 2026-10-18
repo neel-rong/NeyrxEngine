@@ -5,15 +5,13 @@
 #include <thread>
 #include <cassert>
 #include <semaphore>
+
 #include "Neyrx/Core/Container/Queue.h"
 #include "Neyrx/Core/Logger/LogDataStructures.h"
 #include "Neyrx/Core/Logger/Sink.h"
 
 #include <iostream>// temp
 #include <stdio.h> // temp
-
-static constexpr std::size_t NumberOfThreads = 4;
-static constexpr std::size_t ThreadQueueSize = 256;
 
 using namespace std::chrono_literals;
 
@@ -32,39 +30,31 @@ namespace Neyrx::Logger
 	{
 	public:
 
-		LoggerBackEnd() : m_loggerState() {}
+		LoggerBackEnd() : m_loggerThreadRegistry() {}
+
+		// =====================================
+		// Member Functions
+		// =====================================
 
 		void Initialize();
-
-		// Member Functions
-		void QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string InMsg);
-
-
-
-		void TryAndPublishLogData();
-
+		void AddSink(ILoggerSink* InSink);
 		inline void RegisterLogQueue();
 
-		void AddSink(ILoggerSink* InSink)
-		{
-			m_sinks.push_back(InSink);
-		}
-
+		LogThreadContext* GetLogThreadContext() const;
+		uint64_t GetSkippedCount();
 		bool IsIdle() const;
 
-		uint64_t GetSkippedCount();
-
-		static ThreadContext* GetThreadContext()
-		{
-			return g_threadContext;
-		}
+		void QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string InMsg);
+		void TryAndPublishLogData();
 
 	private:
 
-		// Member Variables
+		// =====================================
+		// Member Parameters
+		// =====================================
 
-		LoggerState m_loggerState;
-		inline static thread_local ThreadContext* g_threadContext;
+		LoggerThreadRegistry m_loggerThreadRegistry;
+		inline static thread_local LogThreadContext* g_threadContext;
 		std::atomic<size_t> m_QueueIndex{ 0 };
 		const size_t m_MaxQueueCount = 4;
 

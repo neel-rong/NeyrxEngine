@@ -1,16 +1,25 @@
-#include "Neyrx/Core/Container/Queue.h"
-#include "Neyrx/Core/Logger/Logger.h"
 #include <conio.h>
+
+#include "Neyrx/Core/Container/Queue.h"
+#include "Neyrx/Core/Logger/LogDataStructures.h"
+#include "Neyrx/Core/Logger/Sink.h"
+#include "Neyrx/Core/Logger/Logger.h"
+
+
+using namespace Neyrx::Logger;
 
 
 static std::atomic<bool> StopLog = false;
 
-class TestSink : public Neyrx::Logger::ILoggerSink
+class TestSink : public ILoggerSink
 {
 public:
-    virtual void Consume(const Neyrx::Logger::LogData InLogData) override
+
+	virtual ~TestSink() = default;
+
+    inline virtual void Publish(const Neyrx::Logger::LogData& InLogData) override
     {
-		uint64_t sequenceNumber = InLogData.m_sequence;
+		uint64_t sequenceNumber = InLogData.Sequence;
 
 		if ((sequenceNumber < m_lastSequenceNumber.load(std::memory_order_relaxed)) && sequenceNumber != 0)
         {
@@ -86,7 +95,7 @@ void Logger()
 	std::this_thread::sleep_for(2ms);
 	while (!StopLog)
 	{
-		NX_Logger.ConsumeMessage();
+		NX_Logger.TryAndPublishLogData();
 	}
 }
 

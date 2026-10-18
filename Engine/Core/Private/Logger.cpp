@@ -8,17 +8,23 @@ using namespace Neyrx::Logger;
 // Logger Back End
 // ==========================================================================================================
 
-#define LBE LoggerBackEnd
-
-void LBE::Initialize()
+void LoggerBackEnd::Initialize()
 {
-	m_orderedLogWindow.Initialize(&m_loggerState, &m_sinks);
+	m_orderedLogWindow.Initialize(&m_loggerThreadRegistry);
 }
 
 
 
 
-void LBE::RegisterLogQueue()
+void LoggerBackEnd::AddSink(ILoggerSink* InSink)
+{
+	m_sinks.push_back(InSink);
+}
+
+
+
+
+void LoggerBackEnd::RegisterLogQueue()
 {
 	size_t index = m_QueueIndex.fetch_add(1);
 	if (index >= m_MaxQueueCount)
@@ -26,15 +32,15 @@ void LBE::RegisterLogQueue()
 		std::cerr << "Maximum number of log queues reached. Cannot register more queues." << std::endl;
 		return;
 	}
-	g_threadContext = &m_loggerState.m_threadContexts[index];
+	g_threadContext = &m_loggerThreadRegistry.m_threadContexts[index];
 }
 
 
 
 
-bool LBE::IsIdle() const
+bool LoggerBackEnd::IsIdle() const
 {
-	for (const auto& context : m_loggerState.m_threadContexts)
+	for (const auto& context : m_loggerThreadRegistry.m_threadContexts)
 	{
 		if (!context.m_logBuffer.IsEmpty())
 		{
@@ -47,7 +53,7 @@ bool LBE::IsIdle() const
 
 
 
-uint64_t LBE::GetSkippedCount()
+uint64_t LoggerBackEnd::GetSkippedCount()
 {
 	return m_skippedLogs.load(std::memory_order_relaxed);
 }
@@ -55,7 +61,15 @@ uint64_t LBE::GetSkippedCount()
 
 
 
-void LBE::QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string InMsg)
+LogThreadContext* LoggerBackEnd::GetLogThreadContext() const;
+{
+	return g_threadContext;
+}
+
+
+
+
+void LoggerBackEnd::QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string InMsg)
 {
 	auto startTime = std::chrono::steady_clock::now();
 	uint64_t sequenceNumber = m_globalSequenceNumber.fetch_add(1, std::memory_order_relaxed);
@@ -71,20 +85,85 @@ void LBE::QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string InM
 
 
 
-void LBE::TryAndPublishLogData()
+void LoggerBackEnd::TryAndPublishLogData()
 {
 	// Call reserve Slot at the start of every functionCall
 	m_orderedLogWindow.ReserveLogSlotsForTracking();
 
 	auto& trackedData = m_orderedLogWindow.GetTrackedLogData();
 
-	PublishCursor_Start = trackedData.Begin;
-	if (m_orderedLogWindow.GetState() == OrderedLogWindowState::UNINITIALIZED)
+	PublishCursor_Start = trackedData.Sequence_Begin;
+
+	if (trackedData.GetTrackerState() == LogTrackerState::UNTRACKED)
 	{
 		PublishCursor_End = PublishCursor_Start;
 	}
 
-	bool bMissing = false;
-	bool bCheckQueueEmpty = false;
-	const OrderedLogWindowState& logWindowState = m_orderedLogWindow.TrackLogData(false, bCheckQueueEmpty);
+	const LogTrackerState& trackerState = m_orderedLogWindow.TrackLogData();
+
+	m_orderedLogWindow.PublishStaleData([this](LogData& Data)
+		{
+			for (auto& sink : m_sinks)
+			{
+				sink->Publish(Data);
+			}
+		});
+
+	switch (trackerState)
+	{
+	case LogTrackerState::TRACKED_ALL :
+	{
+		PublishCursor_End = trackedData.Sequence_End;
+
+		m_orderedLogWindow.PublishLogData(PublishCursor_End, [this](LogData& Data)
+			{
+				for (auto& sink : m_sinks)
+				{
+					sink->Publish(Data);
+				}
+			});
+
+		break;
+	}
+
+	case LogTrackerState::TRACKED_WITH_MISSING :
+	{
+		uint64_t missing = m_orderedLogWindow.GetFirstMissingSequenceAfter(PublishCursor_End);
+
+		PublishCursor_End = missing - 1;
+
+		m_orderedLogWindow.PublishLogData(PublishCursor_End, [this](LogData& Data)
+			{
+				for (auto& sink : m_sinks)
+				{
+					sink->Publish(Data);
+				}
+			});
+
+		uint64_t validSeqAfterMissing = m_orderedLogWindow.GetFirstValidSequenceAfter(missing);
+
+		const OrderedLogSlot* validSlotAfterMissing = m_orderedLogWindow.GetTrackedSlot(validSeqAfterMissing);
+
+		auto timeStamp = validSlotAfterMissing->Data->Time;
+
+		// Sleep for the Grace Period
+		std::this_thread::sleep_until(timeStamp + 1ms);
+
+		PublishCursor_End = trackedData.Sequence_End;
+
+		break;
+	}
+
+	case LogTrackerState::FAILURE_EMPTY :
+	{
+		std::this_thread::sleep_for(1ms);
+	}
+
+	default:
+	{
+		std::cout << "FAILED TO PUBLISH" << std::endl;
+		break;
+	}
+
+	}
 }
