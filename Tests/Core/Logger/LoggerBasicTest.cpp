@@ -66,7 +66,7 @@ void Worker()
 	NX_Logger.RegisterLogQueue();
 	while (!StopProducer)
 	{
-		for (int i = 0; i < 8192; ++i)
+		for (int i = 0; i < 4096; ++i)
 		{
 			InputLog(g_msgCount.count);
 		}
@@ -91,19 +91,10 @@ int main()
 	std::thread thread6(Worker);
 	std::thread thread7(Worker);
 	std::thread thread8(Worker);
-	std::thread thread9(Worker);
-	std::thread thread10(Worker);
-
 
 	std::thread thread20(LogWorker);
 
-	/*int end = 0;
-	while (end != 1)
-	{
-		std::cin >> end;
-	}*/
-
-	std::this_thread::sleep_for(std::chrono::seconds(15));
+	std::this_thread::sleep_for(std::chrono::seconds(300));
 
 	StopProducer = true;
 
@@ -115,8 +106,6 @@ int main()
 	thread6.join();
 	thread7.join();
 	thread8.join();
-	thread9.join();
-	thread10.join();
 
 	std::cout << "__PRODUCER THREADS JOINED__" << std::endl;
 

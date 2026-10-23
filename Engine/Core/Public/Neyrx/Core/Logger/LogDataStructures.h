@@ -16,8 +16,8 @@
 inline constexpr uint64_t InvalidSequenceNumber = std::numeric_limits<uint64_t>::max();
 inline constexpr uint64_t Invalidindex = std::numeric_limits<uint64_t>::max();
 
-inline constexpr std::size_t NumberOfThreads = 10;
-inline constexpr std::size_t ThreadQueueSize = 32768;
+inline constexpr std::size_t NumberOfThreads = 8;
+inline constexpr std::size_t ThreadQueueSize = 16384;
 
 inline constexpr std::size_t g_OrderedLogCapacity = ThreadQueueSize * NumberOfThreads;
 
@@ -510,24 +510,24 @@ X(Temp)						\
 						return LogTrackerState::FAILURE_SENTINAL;
 					}
 
-					const LogData* data = &(*it);
+					const LogData* queueBufferData = &(*it);
 
-					if (data == nullptr)
+					if (queueBufferData == nullptr)
 					{
-						std::cout << "Data is Null in SPSC Queue" << std::endl;
+						std::cout << "Data is Null in SPSC Queue" << "\n";
 						assert(false && "Data is Null in SPSC Queue");
 						continue;
 					}
 
-					const uint64_t seq = data->Sequence;
+					const uint64_t seq = queueBufferData->Sequence;
 
 					if (seq == InvalidSequenceNumber)
 					{
-						std::cout << "INVALID Sequence Number FOUND in Context Queue" << std::endl;
+						std::cout << "INVALID Sequence Number FOUND in Context Queue" << "\n";
 						continue;
 					}
 
-					if (m_lastPublishSequence != InvalidSequenceNumber && seq < m_lastPublishSequence)		// Stale sequences bypass tracking
+					if (m_lastPublishSequence != InvalidSequenceNumber && seq <= m_lastPublishSequence)		// Stale sequences bypass tracking
 					{
 						continue;
 					}
@@ -538,6 +538,22 @@ X(Temp)						\
 					}
 
 					std::size_t bMissingIndex = Invalidindex;
+					OrderedLogSlot* orderedSlot = m_orderedLogBuffer.GetReservedSlot(seq);
+					if (orderedSlot == nullptr)
+					{
+						std::cout << "Invalid Slot. The Sequence Number was possibly not reserved" << "\n";
+						assert(false);
+						continue;
+					}
+
+					LogData* orderedData = orderedSlot->Data;
+
+					// If the slot returned by the LogBuffer, already contains a pointer to valid data,
+					// It is a data reserved in the last pass, and is waiting flush
+					if (orderedData != nullptr)
+					{
+						continue;
+					}
 
 					// If expected > seq, then check if the seq is found in m_missingSequences
 					if (expected > seq)
@@ -548,15 +564,7 @@ X(Temp)						\
 
 							if (it == m_trackedData.Sequence_Missing.end())
 							{
-								OrderedLogSlot* slot = m_orderedLogBuffer.GetReservedSlot(seq);
-								if (slot != nullptr && slot->Data != nullptr)
-								{
-									continue;
-								}
-								else
-								{
-									assert(false);
-								}
+								continue;
 							}
 
 							// If seq is a missing sequence, store the index, and pop only if successfully reserved
@@ -564,40 +572,12 @@ X(Temp)						\
 						}
 						else
 						{
-							if (m_orderedLogBuffer.GetReservedSlot(seq)->Data != nullptr)
-							{
-								continue;
-							}
-							else
-							{
-								assert(false);
-							}
+							__debugbreak();
+							assert(false);
 						}
 					}
 
-					OrderedLogSlot* slot = m_orderedLogBuffer.GetReservedSlot(seq);
-
-					if (slot == nullptr)
-					{
-						std::cout << "Invalid Slot. The Sequence Number was possibly not reserved" << std::endl;
-						assert(false);
-						continue;
-					}
-
-
-					// If the slot returned by the LogBuffer, already contains a pointer to valid data,
-					// It is an old or stale data that was not flushed.
-					// The eariler condition statement should have prohinited such conditions to exist
-					// If the asset below is hit, check the validity of condition statements for rejecting sequences first
-					if (slot->Data != nullptr)
-					{
-						__debugbreak();
-						std::cout << "Encountered a reserved slot with valid a data pointer" << std::endl;
-						assert(false);
-						continue;
-					}
-
-					*slot = OrderedLogSlot(0, 0, seq, const_cast<LogData*>(data));
+					*orderedSlot = OrderedLogSlot(0, 0, seq, const_cast<LogData*>(queueBufferData));
 
 					// if expected < seq, reserve all Sequence Numbers between expected and seq
 					if (expected < seq)
@@ -658,8 +638,6 @@ X(Temp)						\
 
 			LogPublishState publishState = LogPublishState::SUCCESS;
 
-			int missingLocal = 0;
-
 			uint64_t expected = m_lastPublishSequence == InvalidSequenceNumber
 				? 0
 				: m_lastPublishSequence + 1;
@@ -672,6 +650,7 @@ X(Temp)						\
 				{
 					std::cout << "Null Slot found in OrderedLogBuffer" << std::endl;
 					assert(false);
+					++expected;
 					continue;
 				}
 
@@ -679,11 +658,10 @@ X(Temp)						\
 
 				if (data == nullptr)
 				{
-					std::cout << "Null Data found in OrderedLogBuffer" << std::endl;
+					//std::cout << "Null Data found in OrderedLogBuffer" << std::endl;
 					MissingDataTemplate.Sequence = expected;
 					PublishFunction(MissingDataTemplate);
 					++m_skippedLogCount;
-					++missingLocal;
 				}
 				else
 				{
@@ -694,22 +672,30 @@ X(Temp)						\
 				++expected;
 			}
 
+			uint64_t begin = m_trackedData.Sequence_Begin;
 
 			// Publish to Sinks and Dequeue the ThreadContext Queues
 			for (auto& context : m_loggerRegistryPointer->m_threadContexts)
 			{
 				auto& logBuffer = context.ThreadQueue;
 
-				if (missingLocal > 0)
+				if (m_skippedLogCount > 0)
 				{
 					while (!logBuffer.IsEmpty() && logBuffer.PeekLogical(0).Sequence <= EndSequenceNumber)
 					{
 						uint64_t seq = logBuffer.PeekLogical(0).Sequence;
-
-						if (std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), seq) !=
+						if (seq < begin)
+						{
+							PublishFunction(logBuffer.PeekLogical(0));
+							--m_skippedLogCount;
+							++m_invertedLogCount;
+						}
+						else if (std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), seq) !=
 							m_trackedData.Sequence_Missing.end())
 						{
 							PublishFunction(logBuffer.PeekLogical(0));
+							--m_skippedLogCount;
+							++m_invertedLogCount;
 						}
 
 						logBuffer.Dequeue();
@@ -758,11 +744,6 @@ X(Temp)						\
 				{
 					uint64_t missingSeq = m_trackedData.Sequence_Missing[MissingIndex];
 
-					if (missingLocal > 0)
-					{
-
-					}
-
 					if (missingSeq <= EndSequenceNumber)
 					{
 						std::swap(m_trackedData.Sequence_Missing[MissingIndex], m_trackedData.Sequence_Missing.back());
@@ -776,35 +757,6 @@ X(Temp)						\
 			}
 
 			return publishState;
-		}
-
-
-
-		// Publish log data squence number < m_lastPublishedData
-		template <typename StalePublisher>
-		void PublishLogData_Stale(StalePublisher&& PublishFunction)
-		{
-			for (auto& context : m_loggerRegistryPointer->m_threadContexts)
-			{
-				auto& queue = context.ThreadQueue;
-
-				while (!queue.IsEmpty())
-				{
-					const LogData* data = &queue.PeekLogical(0);
-
-					if (data->Sequence < m_lastPublishSequence)
-					{
-						PublishFunction(*data);
-						--m_skippedLogCount;
-						++m_invertedLogCount;
-						queue.Dequeue();
-
-						continue;
-					}
-
-					break;
-				}
-			}
 		}
 
 	private:

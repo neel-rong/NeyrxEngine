@@ -88,6 +88,7 @@ void Logger::QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string 
 	{
 		std::this_thread::yield();
 	}*/
+	const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 
 	uint64_t sequenceNumber = m_globalSequenceNumber.fetch_add(1, std::memory_order_relaxed);
 
@@ -95,6 +96,12 @@ void Logger::QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string 
 	{
 		std::cout << "Queue Failed for Seq: " << sequenceNumber << "\n";
 	}
+
+	const std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+
+	const auto& duration = end - start;
+	if (duration > std::chrono::milliseconds(1))
+	std::cout << "Queue Duration: " << duration << "\n";
 }
 
 
@@ -163,6 +170,8 @@ void Logger::TryAndPublishLogData()
 				}
 			});
 
+
+
 		if (!trackedData.Sequence_Missing.empty())
 		{
 			missing = m_orderedLogWindow.GetFirstMissingSequenceAfter(PublishCursor_End);
@@ -203,13 +212,4 @@ void Logger::TryAndPublishLogData()
 	}
 
 	}
-
-	// After the TrackedLogData Publish loop, check for any stale data and publish and Dequeue
-	m_orderedLogWindow.PublishLogData_Stale([this](const LogData& Data)
-		{
-			for (const auto& sink : m_sinks)
-			{
-				sink->Publish(Data);
-			}
-		});
 }

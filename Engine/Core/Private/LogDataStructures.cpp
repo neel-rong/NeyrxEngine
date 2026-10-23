@@ -156,7 +156,11 @@ const OrderedLogSlot* OrderedLogBuffer::GetReservedSlot(const uint64_t InSequenc
 {
 	BufferPosition bpos = GetBufferPosition(InSequenceNumber);
 
-	if (!bpos.IsValid()) return nullptr;
+	if (!bpos.IsValid())
+	{
+		__debugbreak();
+		return nullptr;
+	}
 
 	const OrderedLogSlot* slot = &OrderedLogBuffers[bpos.ChunkIndex][bpos.Offset];
 
