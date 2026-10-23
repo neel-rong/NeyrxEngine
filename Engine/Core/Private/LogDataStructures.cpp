@@ -1,4 +1,5 @@
 #include <cassert>
+#include <intrin.h>
 
 #include "Neyrx/Core/Logger/LogDataStructures.h"
 
@@ -13,7 +14,7 @@ using namespace Neyrx::Logger;
 
 LogReserveState OrderedLogBuffer::GetReserveState()
 {
-	return m_logReserveState;
+	return m_reservedLogData.GetLogReserveState();
 }
 
 
@@ -21,7 +22,7 @@ LogReserveState OrderedLogBuffer::GetReserveState()
 
 uint64_t OrderedLogBuffer::GetStartReservedSequenceNumber() const
 {
-	return m_startReservedSequenceNumber;
+	return m_reservedLogData.SequenceNumber_Start;
 }
 
 
@@ -29,7 +30,7 @@ uint64_t OrderedLogBuffer::GetStartReservedSequenceNumber() const
 
 uint64_t OrderedLogBuffer::GetEndReservedSequenceNumber() const
 {
-	return m_endReservedSequenceNumber;
+	return m_reservedLogData.SequenceNumber_End;
 }
 
 
@@ -37,7 +38,7 @@ uint64_t OrderedLogBuffer::GetEndReservedSequenceNumber() const
 
 uint64_t OrderedLogBuffer::GetMaxReservedSequenceNumber() const
 {
-	return m_maxReservedSequenceNumber;
+	return m_reservedLogData.SequenceNumber_Max;
 }
 
 
@@ -106,14 +107,14 @@ void OrderedLogBuffer::IncrementBufferPosition(BufferPosition& InBufferPosition)
 OrderedLogBuffer::BufferPosition OrderedLogBuffer::GetBufferPosition(const uint64_t InSequenceNumber) const
 {
 	// Return null if the buffer is empty, or no reserve functional call has been made yet
-	if (IsEmpty() || m_maxReservedSequenceNumber == InvalidSequenceNumber) return BufferPosition();
+	if (IsEmpty() || m_reservedLogData.GetLogReserveState() == LogReserveState::UNINITIALIZED) return BufferPosition();
 
 	// Return null if InSequenceNumber is a stale sequence number
-	if (InSequenceNumber < m_startReservedSequenceNumber) return BufferPosition();
+	if (InSequenceNumber < m_reservedLogData.SequenceNumber_Start) return BufferPosition();
 
 	std::size_t totalBufferSize = GetSize();
 
-	uint64_t sequenceOffset = InSequenceNumber - m_startReservedSequenceNumber;
+	uint64_t sequenceOffset = InSequenceNumber - m_reservedLogData.SequenceNumber_Start;
 
 	// Return null if InSequenceNumber is not within reserved range
 	if (sequenceOffset >= totalBufferSize) return BufferPosition();
@@ -168,29 +169,35 @@ const OrderedLogSlot* OrderedLogBuffer::GetReservedSlot(const uint64_t InSequenc
 LogReserveState OrderedLogBuffer::DereserveSequences(uint64_t EndSequenceNumber)
 {
 	if (EndSequenceNumber == InvalidSequenceNumber ||
-		EndSequenceNumber < m_startReservedSequenceNumber
-		|| EndSequenceNumber > m_endReservedSequenceNumber)	// TODO - Error Handling
+		EndSequenceNumber < m_reservedLogData.SequenceNumber_Start
+		|| EndSequenceNumber > m_reservedLogData.SequenceNumber_End)	// TODO - Error Handling
 	{
+		__debugbreak();
 		std::cout << "Invalid End Sequence" << std::endl;
 		return LogReserveState::FAILURE_SEQUENCE_INVALID;
 	}
 
-	uint64_t Start = m_startReservedSequenceNumber;	// Set Start to Oldest Sequence Number
+	uint64_t Start = m_reservedLogData.SequenceNumber_Start;	// Set Start to Oldest Sequence Number
 	uint64_t End = EndSequenceNumber;
 
 	std::size_t size = GetSize();		// If later Dereserve Is more linient in respect of Start this will be useful
-	std::size_t offset = Start - m_startReservedSequenceNumber;
+	std::size_t offset = Start - m_reservedLogData.SequenceNumber_Start;
 	std::size_t count = End - Start + 1;
 
 	if (offset >= size || offset + count > size)
 	{
+		__debugbreak();
 		std::cout << "Sequences Out of Range" << std::endl;
 		return LogReserveState::FAILURE_SEQUENCE_INVALID;
 	}
 
 	BufferPosition bufPos = GetBufferPosition(Start);
 
-	if (!bufPos.IsValid()) return LogReserveState::INVALID_INTERNAL_STATE;
+	if (!bufPos.IsValid())
+	{
+		__debugbreak();
+		return LogReserveState::INVALID_INTERNAL_STATE;
+	}
 
 	for (uint64_t seq = Start;; ++seq)
 	{
@@ -214,20 +221,21 @@ LogReserveState OrderedLogBuffer::DereserveSequences(uint64_t EndSequenceNumber)
 
 	if (IsEmpty())
 	{
-		m_startReservedSequenceNumber = InvalidSequenceNumber;
+		m_reservedLogData.SequenceNumber_Start = InvalidSequenceNumber;
+		m_reservedLogData.SequenceNumber_End = InvalidSequenceNumber;
 		m_bufferIndexStart = BufferPosition{ 0, 0 };
 		m_bufferWriteCursor = BufferPosition{ 0, 0 };
 
-		m_logReserveState = LogReserveState::SUCCESS_DERESERVED_EMPTY;
+		return LogReserveState::DERESERVED_EMPTY;
 	}
 	else
 	{
-		m_startReservedSequenceNumber = End + 1;
+		m_reservedLogData.SequenceNumber_Start = End + 1;
 
-		m_logReserveState = LogReserveState::SUCCESS_DERESERVED;
+		return LogReserveState::DERESERVED;
 	}
 
-	return m_logReserveState;
+	return LogReserveState::INVALID_INTERNAL_STATE;
 }
 
 
@@ -237,7 +245,6 @@ LogReserveState OrderedLogBuffer::ReserveSequences(const uint64_t InStartSequenc
 {
 	if (!HasFreeChunk())				// Not enough capacity to reserve all sequences
 	{
-		m_logReserveState = LogReserveState::FAILURE_AT_CAPACITY;
 		return LogReserveState::FAILURE_AT_CAPACITY;
 	}
 
@@ -247,23 +254,22 @@ LogReserveState OrderedLogBuffer::ReserveSequences(const uint64_t InStartSequenc
 		return LogReserveState::FAILURE_SENTINAL;
 	}
 
+	LogReserveState state = m_reservedLogData.GetLogReserveState();
 
-	if (m_logReserveState == LogReserveState::UNINITIALIZED)				// First ReserveSlots function call, no prior ReserveSlots function call was made
+	if (state == LogReserveState::INVALID_INTERNAL_STATE) return state;
+
+	if (state != LogReserveState::UNINITIALIZED && InStartSequenceNumber != m_reservedLogData.SequenceNumber_Max + 1)
 	{
-		m_startReservedSequenceNumber = InStartSequenceNumber;
-	}
-	else	// Do not reserve Sequences that are already reserved, and reject gaps between last reserved sequence number
-	{
-		if (InStartSequenceNumber != m_maxReservedSequenceNumber + 1) return LogReserveState::FAILURE_SEQUENCE_INVALID;
+		return LogReserveState::FAILURE_SEQUENCE_INVALID;
 	}
 
-	uint64_t sequence = InvalidSequenceNumber;
+	const uint64_t end = InStartSequenceNumber + Capacity; // exclusive end
 
 	// Reserves Capacity(value of) consecutive sequence numbers in the ordered buffer.
 	// Reservations continue from BufferWriteCursor, the next physical write
 	// position. A full chunk advances the cursor to the next chunk at offset 0.
 	// The next chunk must be empty before it can be used.
-	for (std::size_t i = 0; i < Capacity; ++i)						// No more than single chunks capacity should be reserved during a pass
+	for (uint64_t sequence = InStartSequenceNumber; sequence < end; ++sequence)						// No more than single chunks capacity should be reserved during a pass
 	{
 		if (m_bufferWriteCursor.Offset >= Capacity)					// If the present chunk is full, move to the next chunk
 		{
@@ -274,25 +280,20 @@ LogReserveState OrderedLogBuffer::ReserveSequences(const uint64_t InStartSequenc
 			m_bufferWriteCursor.Offset = 0;
 		}
 
-		sequence = InStartSequenceNumber + static_cast<uint64_t>(i);
 		OrderedLogBuffers[m_bufferWriteCursor.ChunkIndex][m_bufferWriteCursor.Offset].SequenceNumber = sequence;
 		++m_bufferWriteCursor.Offset;
 		++m_bufferSize[m_bufferWriteCursor.ChunkIndex];
 	}
 
-	m_endReservedSequenceNumber = sequence;
-	m_maxReservedSequenceNumber = sequence;
-
-	if (IsEmpty())
+	if (state != LogReserveState::RESERVED)
 	{
-		m_logReserveState = LogReserveState::SUCCESS_DERESERVED_EMPTY;
-	}
-	else
-	{
-		m_logReserveState = LogReserveState::SUCCESS_DERESERVED;
+		m_reservedLogData.SequenceNumber_Start = InStartSequenceNumber;
 	}
 
-	return m_logReserveState;
+	m_reservedLogData.SequenceNumber_End = end - 1;
+	m_reservedLogData.SequenceNumber_Max = end - 1;
+
+	return m_reservedLogData.GetLogReserveState();
 }
 
 
@@ -305,7 +306,6 @@ LogReserveState OrderedLogBuffer::ReserveSequences(const uint64_t InStartSequenc
 void OrderedLogWindow::Initialize(LoggerThreadRegistry* InLoggerState)
 {
 	m_loggerRegistryPointer = InLoggerState;
-	m_staleLogBuffer.reserve(Capacity);
 }
 
 
@@ -315,7 +315,8 @@ const OrderedLogSlot* OrderedLogWindow::GetFirstAccountedLogSlot() const
 {
 	for (uint64_t i = m_trackedData.Sequence_Begin; i <= m_trackedData.Sequence_End; ++i)
 	{
-		if (std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), i) != m_trackedData.Sequence_Missing.end())
+		auto it = std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), i);
+		if (it != m_trackedData.Sequence_Missing.end())
 		{
 			const OrderedLogSlot* slot = m_orderedLogBuffer.GetReservedSlot(i);
 			if (slot != nullptr) return slot;
@@ -348,8 +349,8 @@ uint64_t OrderedLogWindow::GetFirstValidSequenceAfter(uint64_t SequenceNumber) c
 
 	for (uint64_t seq = SequenceNumber + 1; seq <= m_trackedData.Sequence_End; ++seq)
 	{
-		if (std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), m_trackedData.Sequence_Missing)
-			!= m_trackedData.Sequence_Missing.end())
+		auto it = std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), seq);
+		if (it == m_trackedData.Sequence_Missing.end() && m_orderedLogBuffer.GetReservedSlot(seq)->Data != nullptr)
 		{
 			return seq;
 		}
@@ -358,12 +359,46 @@ uint64_t OrderedLogWindow::GetFirstValidSequenceAfter(uint64_t SequenceNumber) c
 	return InvalidSequenceNumber;
 }
 
+const OrderedLogSlot* OrderedLogWindow::GetFirstValidLogSlotAfter(uint64_t SequenceNumber) const
+{
+	if (SequenceNumber >= m_trackedData.Sequence_End) return nullptr;
+
+	for (uint64_t seq = SequenceNumber + 1; seq <= m_trackedData.Sequence_End; ++seq)
+	{
+		auto it = std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), seq);
+		if (it == m_trackedData.Sequence_Missing.end())
+		{
+			const OrderedLogSlot* slot = m_orderedLogBuffer.GetReservedSlot(seq);
+
+			if (slot->Data != nullptr) return slot;
+		}
+	}
+
+	return nullptr;
+}
+
 
 
 
 uint64_t OrderedLogWindow::GetMaxReservedSequence() const
 {
 	return m_orderedLogBuffer.GetMaxReservedSequenceNumber();
+}
+
+
+
+
+uint64_t OrderedLogWindow::GetInvertedCount() const
+{
+	return m_invertedLogCount;
+}
+
+
+
+
+uint64_t OrderedLogWindow::GetSkippedCount() const
+{
+	return m_skippedLogCount;
 }
 
 
@@ -403,191 +438,25 @@ const TrackedLogData& OrderedLogWindow::GetTrackedLogData() const
 
 LogReserveState OrderedLogWindow::ReserveLogSlotsForTracking()
 {
-	uint64_t lastRes = m_orderedLogBuffer.GetEndReservedSequenceNumber();
+	LogReserveState state = m_orderedLogBuffer.GetReserveState();
+	uint64_t maxRes = m_orderedLogBuffer.GetMaxReservedSequenceNumber();
+	uint64_t startRes = InvalidSequenceNumber;
 
-	if (m_orderedLogBuffer.GetReserveState() != LogReserveState::UNINITIALIZED &&			// Sentinal Gaurd
-		lastRes >= InvalidSequenceNumber - Capacity)
+	if (state == LogReserveState::INVALID_INTERNAL_STATE) return state;
+
+	if (state != LogReserveState::UNINITIALIZED)
 	{
-		return LogReserveState::FAILURE_SENTINAL;
-	}
+		if (maxRes >= InvalidSequenceNumber - Capacity)	// Sentinal Gaurd
+		{
+			return LogReserveState::FAILURE_SENTINAL;
+		}
 
-	// If Tracker is uninitialized, then this is the first function call, use startRes as 0
-	uint64_t startRes = m_trackedData.GetTrackerState() == LogTrackerState::UNINITIALIZED
-		? 0
-		: lastRes + 1;
-
-	return m_orderedLogBuffer.ReserveSequences(startRes);
-}
-
-
-
-
-LogTrackerState OrderedLogWindow::TrackLogData()
-{
-	uint64_t oldestSeq = m_orderedLogBuffer.GetStartReservedSequenceNumber();
-
-	if (m_orderedLogBuffer.GetReserveState() == LogReserveState::UNINITIALIZED)
-	{
-		return LogTrackerState::FAILURE_NO_RESERVE;
-	}
-
-	if (m_trackedData.GetTrackerState() == LogTrackerState::UNINITIALIZED &&
-		m_trackedData.GetTrackerState() == LogTrackerState::UNINITIALIZED)
-	{
-		m_startSequenceThisPass = 0;
+		startRes = maxRes + 1;
 	}
 	else
 	{
-		// This cannot result in a InvalidSequenceNumber
-		// since the OrderLogBuffer reserve plicy wont allow resering any slot that equals InvalidSequenceNumber
-		m_startSequenceThisPass = m_trackedData.Sequence_MaxTracked + 1;
+		startRes = 0;
 	}
 
-	bool bAllQueueEmpty = true;
-
-	for (LogThreadContext& contex : m_loggerRegistryPointer->m_threadContexts)
-	{
-		auto& buffer = contex.m_logBuffer;
-
-		if (buffer.IsEmpty())
-		{
-			continue;
-		}
-		else
-		{
-			bAllQueueEmpty = false;
-		}
-
-		auto ItSnap = buffer.GetRingBufferIteratorSnapshot();
-
-		for (auto it = ItSnap.Begin; it != ItSnap.End; ++it)
-		{
-			const LogData* data = &buffer.Peek(it.GetIndex());
-
-			if (data == nullptr)
-			{
-				std::cout << "Data is Null in SPSC Queue" << std::endl;
-				assert(false && "Data is Null in SPSC Queue");
-				continue;
-			}
-
-			const uint64_t seq = data->Sequence;
-
-			if (seq == InvalidSequenceNumber)
-			{
-				std::cout << "INVALID Sequence Number FOUND in Context Queue" << std::endl;
-				continue;
-			}
-
-			if (seq < oldestSeq) // Stale sequence use the bypass function || This is temporary
-			{
-				m_staleLogBuffer.push_back(data);
-			}
-
-			// If the sequence is such that it exceeds the max Sequence Number that can be reserved this pass,
-			// break and conitnue with the next thread context.
-			// This thread context connot contain a smaller sequence number
-			const uint64_t rangeStart = m_startSequenceThisPass == InvalidSequenceNumber ? 0 : m_startSequenceThisPass;
-
-			if (seq > rangeStart)			// seq if not greater than range start, is greater than oldestRserved, and is a missing data. Should bypass this check
-			{
-				const uint64_t offset = seq - rangeStart;
-				if (offset >= Capacity) break;
-			}
-
-			// If no log has been consumed/reserved then use expected as 0. This results in the index of the incoming sequence passing the threashold.
-			uint64_t expected = m_trackedData.GetTrackerState() == LogTrackerState::UNINITIALIZED ? 0 : m_trackedData.Sequence_End + 1;
-
-			if (expected == InvalidSequenceNumber)
-			{
-				return LogTrackerState::FAILURE_SENTINAL;
-			}
-
-			std::size_t bMissingIndex = Invalidindex;
-
-			// If expected > seq, then check if the seq is found in m_missingSequences
-			// if expected < seq, reserve all Sequence Numbers between expected and seq
-			if (seq < expected)
-			{// If seq is not a missing tracked sequence, the seq has already been reserved in the previous pass and is waiting flush
-				if (m_trackedData.Sequence_Missing.size() != 0)
-				{
-					auto it = std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), seq);
-
-					if (it == m_trackedData.Sequence_Missing.end() && m_trackedData.Sequence_Missing.size())
-					{
-						assert(false && "OrderLogWindow Missing Sequence Bug");
-					}
-
-					// If seq is a missing sequence, store the index, and pop only if successfully reserved
-					bMissingIndex = static_cast<std::size_t>(std::distance(m_trackedData.Sequence_Missing.begin(), it));
-				}
-			}
-			else if (seq > expected)
-			{
-				// if seq > expected, mark all in between sequences as missing
-				// and push back into m_missingSequences
-				if (seq > expected)
-				{
-					for (uint64_t missing = expected; missing < seq; ++missing)
-					{
-						m_trackedData.Sequence_Missing.push_back(missing);
-					}
-				}
-			}
-
-			OrderedLogSlot* slot = m_orderedLogBuffer.GetReservedSlot(seq);
-
-			if (slot == nullptr)
-			{
-				std::cout << "Invalid Slot. The Sequence Number was possibly not reserved" << std::endl;
-				assert(false);
-				continue;
-			}
-
-
-			// If the slot returned by the LogBuffer, already contains a pointer to valid data,
-			// It is an old or stale data that was not flushed.
-			// The eariler condition statement should have prohinited such conditions to exist
-			// If the asset below is hit, check the validity of condition statements for rejecting sequences first
-			if (slot->Data != nullptr)
-			{
-				std::cout << "Encountered a reserved slot with valid a data pointer" << std::endl;
-				assert(false);
-				continue;
-			}
-
-			*slot = OrderedLogSlot(0, 0, seq, const_cast<LogData*>(data));
-
-			if (m_trackedData.Sequence_End == InvalidSequenceNumber || m_trackedData.Sequence_End < seq)
-			{
-				m_trackedData.Sequence_End = seq;
-				m_trackedData.Sequence_MaxTracked = seq;
-			}
-
-			// If seq is a missing index, swap and pop from m_trackedData.SequenceMissing
-			if (bMissingIndex != Invalidindex)
-			{
-				std::swap(m_trackedData.Sequence_Missing[bMissingIndex], m_trackedData.Sequence_Missing.back());
-				m_trackedData.Sequence_Missing.pop_back();
-			}
-		}
-	}
-
-	if (m_trackedData.GetTrackerState() == LogTrackerState::UNINITIALIZED || m_trackedData.GetTrackerState() == LogTrackerState::UNTRACKED)
-	{
-		if (bAllQueueEmpty)
-		{
-			return LogTrackerState::FAILURE_EMPTY;
-		}
-	}
-
-	return m_trackedData.GetTrackerState();
-}
-
-
-
-
-bool OrderedLogWindow::IsStaleDataPending() const
-{
-	return m_staleLogBuffer.size() != 0;
+	return m_orderedLogBuffer.ReserveSequences(startRes);
 }

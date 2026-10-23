@@ -26,12 +26,12 @@ namespace Neyrx
 		RingBufferIterator(PointerType Pointer, std::size_t Head, std::size_t Index, std::size_t Capacity) :
 			m_ptr(Pointer),
 			m_head(Head),
-			m_index(Index),
+			m_offset(Index),
 			m_capacity(Capacity) { }
 
 		RingBufferIterator& operator++()
 		{
-			++m_index;
+			++m_offset;
 
 			return *this;
 		}
@@ -47,8 +47,8 @@ namespace Neyrx
 
 		RingBufferIterator& operator--()
 		{
-			assert(m_index > 0);
-			--m_index;
+			assert(m_offset > 0);
+			--m_offset;
 
 			return *this;
 		}
@@ -65,56 +65,56 @@ namespace Neyrx
 		RingBufferIterator operator+(std::size_t Offset) const
 		{
 			RingBufferIterator iterator = *this;
-			iterator.m_index += Offset;
+			iterator.m_offset += Offset;
 
 			return iterator;
 		}
 
 		RingBufferIterator operator-(std::size_t Offset) const
 		{
-			assert(Offset <= m_index);
+			assert(Offset <= m_offset);
 
 			RingBufferIterator iterator = *this;
-			iterator.m_index -= Offset;
+			iterator.m_offset -= Offset;
 
 			return iterator;
 		}
 
 		RingBufferIterator& operator+=(std::size_t Offset)
 		{
-			m_index += Offset;
+			m_offset += Offset;
 
 			return *this;
 		}
 
 		RingBufferIterator& operator-=(std::size_t Offset)
 		{
-			assert(Offset <= m_index);
-			m_index -= Offset;
+			assert(Offset <= m_offset);
+			m_offset -= Offset;
 
 			return *this;
 		}
 
 		ReferenceType operator[](std::size_t Index) const
 		{
-			return m_ptr[(m_head + m_index + Index) % m_capacity];
+			return m_ptr[(m_head + m_offset + Index) % m_capacity];
 		}
 
 		PointerType operator->() const
 		{
-			return &m_ptr[(m_head + m_index) % m_capacity];
+			return &m_ptr[(m_head + m_offset) % m_capacity];
 		}
 
 		ReferenceType operator*() const
 		{
-			return m_ptr[(m_head + m_index) % m_capacity];
+			return m_ptr[(m_head + m_offset) % m_capacity];
 		}
 
 		bool operator==(const RingBufferIterator& Other) const
 		{
 			return m_ptr == Other.m_ptr &&
 					m_head == Other.m_head &&
-					m_index == Other.m_index;
+				m_offset == Other.m_offset;
 		}
 
 		bool operator!=(const RingBufferIterator& Other) const
@@ -124,13 +124,13 @@ namespace Neyrx
 
 		std::size_t GetIndex()
 		{
-			return m_index;
+			return m_offset;
 		}
 
 	private:
 		PointerType m_ptr = nullptr;	// Physical Storage
 		std::size_t m_head = 0;			// Physical Location of Logical 0
-		std::size_t m_index = 0;		// Logical Iterator Position
+		std::size_t m_offset = 0;		// Offset from m_head; not a physical position
 		std::size_t m_capacity = 0;		// Physical Capacity
 	};
 
@@ -334,6 +334,7 @@ namespace Neyrx
 		requires(Capacity >= 2)
 	struct SPSCRingBuffer
 	{
+		SPSCRingBuffer() = default;
 	public:
 
 		using ValueType = T;
@@ -359,6 +360,12 @@ namespace Neyrx
 		std::size_t FrontIndex() const
 		{
 			return m_head.load(std::memory_order_relaxed);
+		}
+
+		// Returns the Back Physical Index
+		std::size_t BackIndex() const
+		{
+			return m_tail.load(std::memory_order_relaxed);
 		}
 
 		// Returns true if the Queue is Full, false otherwise

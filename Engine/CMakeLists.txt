@@ -7,7 +7,8 @@ add_library(
     STATIC
 
     Core/Private/Logger.cpp
- "Core/Public/Neyrx/Core/Logger/LogDataStructures.h" "Core/Private/LogDataStructures.cpp")
+    Core/Private/LogDataStructures.cpp
+ )
 
 target_include_directories(
     NeyrxCore

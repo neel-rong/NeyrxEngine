@@ -1,15 +1,13 @@
 #include <conio.h>
 
-#include "Neyrx/Core/Container/Queue.h"
-#include "Neyrx/Core/Logger/LogDataStructures.h"
-#include "Neyrx/Core/Logger/Sink.h"
 #include "Neyrx/Core/Logger/Logger.h"
 
 
 using namespace Neyrx::Logger;
 
 
-static std::atomic<bool> StopLog = false;
+static std::atomic<bool> StopProducer = false;
+static std::atomic<bool> StopConsumer = false;
 
 class TestSink : public ILoggerSink
 {
@@ -19,52 +17,17 @@ public:
 
     inline virtual void Publish(const Neyrx::Logger::LogData& InLogData) override
     {
-		uint64_t sequenceNumber = InLogData.Sequence;
-
-		if ((sequenceNumber < m_lastSequenceNumber.load(std::memory_order_relaxed)) && sequenceNumber != 0)
-        {
-            std::cout << "Error: Sequence number is not in order. Last: " << m_lastSequenceNumber << ", Current: " << sequenceNumber << "\n";
-			bFail = true;
-			m_inversionCount.fetch_add(1, std::memory_order_release);
-			return;
-		}
-		else
-		{
-			std::cout << "Sequence number is in order. Last: " << m_lastSequenceNumber << ", Current: " << sequenceNumber << "\n";
-
-			m_lastSequenceNumber.store(sequenceNumber, std::memory_order_relaxed);
-			m_messageCount.fetch_add(1, std::memory_order_relaxed);
-        }
-	}
-
-	const bool IsFailed() const
-	{
-		return bFail.load(std::memory_order_relaxed);
+		++m_messageCount;
 	}
 
 	uint64_t GetMessageCount() const
 	{
-		return m_messageCount.load(std::memory_order_relaxed);
-	}
-
-	uint64_t GetMessageCount()
-	{
-		return m_messageCount.load(std::memory_order_relaxed);
-	}
-
-	int GetInversionCount()
-	{
-		return m_inversionCount.load(std::memory_order_relaxed);
-	}
-
-	int GetSkippedCount()
-	{
-		return NX_Logger.GetSkippedCount();
+		return m_messageCount;
 	}
 
 private:
-    std::atomic<uint64_t> m_lastSequenceNumber = 0;
-	std::atomic<uint64_t> m_messageCount = 0;
+    uint64_t m_lastSequenceNumber = InvalidSequenceNumber;
+	uint64_t m_messageCount = 0;
     std::atomic<bool> bFail = false;
 	std::atomic<int> m_inversionCount = 0;
 };
@@ -90,10 +53,9 @@ void InputLog(int& count)
 	count++;
 }
 
-void Logger()
+void LogWorker()
 {
-	std::this_thread::sleep_for(2ms);
-	while (!StopLog)
+	while (!StopConsumer)
 	{
 		NX_Logger.TryAndPublishLogData();
 	}
@@ -102,9 +64,12 @@ void Logger()
 void Worker()
 {
 	NX_Logger.RegisterLogQueue();
-	while (!StopLog)
+	while (!StopProducer)
 	{
-		InputLog(g_msgCount.count);
+		for (int i = 0; i < 8192; ++i)
+		{
+			InputLog(g_msgCount.count);
+		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
 }
@@ -122,45 +87,76 @@ int main()
 	std::thread thread2(Worker);
 	std::thread thread3(Worker);
 	std::thread thread4(Worker);
+	std::thread thread5(Worker);
+	std::thread thread6(Worker);
+	std::thread thread7(Worker);
+	std::thread thread8(Worker);
+	std::thread thread9(Worker);
+	std::thread thread10(Worker);
 
 
-	std::thread thread5(Logger);
+	std::thread thread20(LogWorker);
 
-	while (!StopLog)
+	/*int end = 0;
+	while (end != 1)
 	{
-		int stop = 0;
-		std::cin >> stop;
+		std::cin >> end;
+	}*/
 
-		if (stop == 1)
-		{
-			StopLog.store(true, std::memory_order_release);
-		}
-	}
+	std::this_thread::sleep_for(std::chrono::seconds(15));
 
-	StopLog = true;
+	StopProducer = true;
 
 	thread1.join();
 	thread2.join();
 	thread3.join();
 	thread4.join();
 	thread5.join();
+	thread6.join();
+	thread7.join();
+	thread8.join();
+	thread9.join();
+	thread10.join();
 
-	if (testSink.IsFailed())
+	std::cout << "__PRODUCER THREADS JOINED__" << std::endl;
+
+	while (!NX_Logger.IsIdle())
 	{
-		std::cout << "\nLogger Test Failed.\n";
-		std::cout << "\nInversion Count" << testSink.GetInversionCount() << std::endl;
-		std::cout << "\nSkipped Count" << testSink.GetSkippedCount() << std::endl;
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+	}
 
-		return -1;
+	StopConsumer = true;
+
+
+	thread20.join();
+	std::cout << "__Consumer THREADS JOINED__" << std::endl;
+
+	uint64_t inversionCount = NX_Logger.GetInvertedCount();
+	uint64_t skippedCount = NX_Logger.GetSkippedCount();
+	uint64_t MsgCount = testSink.GetMessageCount();
+
+	int result = -1;
+
+	if (inversionCount == 0 && skippedCount == 0)
+	{
+		std::cout << "Logger Test Passed.\n";
+		std::cout << "\nInversion Count" << inversionCount << std::endl;
+		std::cout << "\nSkipped Count" << skippedCount << std::endl;
+		std::cout << "\nMessage Count" << MsgCount << std::endl;
+
+		result = 0;
 	}
 	else
 	{
-		std::cout << "Logger Test Passed.\n";
-		std::cout << "\nInversion Count" << testSink.GetInversionCount() << std::endl;
-		std::cout << "\nSkipped Count" << testSink.GetSkippedCount() << std::endl;
+		std::cout << "\nLogger Test Failed.\n";
+		std::cout << "\nInversion Count" << inversionCount << std::endl;
+		std::cout << "\nSkipped Count" << skippedCount << std::endl;
+		std::cout << "\nMessage Count" << MsgCount << std::endl;
+
+		result = -1;
 	}
 
-	std::cin;
+	getch();
 
-	return 0;
+	return result;
 }

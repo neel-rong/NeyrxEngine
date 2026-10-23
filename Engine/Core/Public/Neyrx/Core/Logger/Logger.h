@@ -13,24 +13,17 @@
 #include <iostream>// temp
 #include <stdio.h> // temp
 
-using namespace std::chrono_literals;
-
-void TRACE(uint64_t sequence, std::string event)
-{
-	//std::cout << "\mTRACE: \nSequence: " << sequence << " | Event: " << event << " | ThreadID: " << std::this_thread::get_id << " | CLOCK: " << std::chrono::system_clock::now() << "\n\n";
-}
-
 namespace Neyrx::Logger
 {
 	// ==========================================================================================================
 	// Logger Back End
 	// ==========================================================================================================
 
-	class LoggerBackEnd
+	class Logger
 	{
 	public:
 
-		LoggerBackEnd() : m_loggerThreadRegistry() {}
+		Logger() : m_loggerThreadRegistry() {}
 
 		// =====================================
 		// Member Functions
@@ -38,9 +31,10 @@ namespace Neyrx::Logger
 
 		void Initialize();
 		void AddSink(ILoggerSink* InSink);
-		inline void RegisterLogQueue();
+		void RegisterLogQueue();
 
-		LogThreadContext* GetLogThreadContext() const;
+		LogThreadContext* GetLogThreadContext();
+		uint64_t GetInvertedCount();
 		uint64_t GetSkippedCount();
 		bool IsIdle() const;
 
@@ -54,16 +48,14 @@ namespace Neyrx::Logger
 		// =====================================
 
 		LoggerThreadRegistry m_loggerThreadRegistry;
-		inline static thread_local LogThreadContext* g_threadContext;
+		inline static thread_local LogThreadContext* g_threadContext = nullptr;
 		std::atomic<size_t> m_QueueIndex{ 0 };
-		const size_t m_MaxQueueCount = 4;
+		const size_t m_MaxQueueCount = NumberOfThreads;
 
 		OrderedLogWindow m_orderedLogWindow;
 
 		std::atomic<uint64_t> m_globalSequenceNumber{ 0 };
 		std::atomic<uint64_t> m_lastConsumedSequenceNumber = InvalidSequenceNumber;
-
-		std::atomic<uint64_t> m_skippedLogs{ 0 };
 
 		std::vector<ILoggerSink*> m_sinks;
 
@@ -72,7 +64,7 @@ namespace Neyrx::Logger
 	};
 };
 
-static Neyrx::Logger::LoggerBackEnd NX_Logger;
+extern Neyrx::Logger::Logger NX_Logger;
 
 
 
