@@ -191,6 +191,14 @@ namespace Neyrx
 
 
 	public:
+
+		// Resets the RingBuffer to an empty state
+		void Reset()
+		{
+			m_head = 0;
+			m_tail = 0;
+		}
+
 		// Returns the Front Physical Index
 		std::size_t FrontIndex() const
 		{
@@ -270,13 +278,42 @@ namespace Neyrx
 		}
 
 		// Moves an RValue in to the Queue
-		void Enqueue(T&& InObject)
+		bool Enqueue(T&& InObject)
 		{
-			if (IsFull()) return;
+			if (IsFull()) return false;
 
 			m_data[m_tail] = std::move(InObject);
 
 			m_tail = (m_tail + 1) % Capacity;
+
+			return true;
+		}
+
+		bool ReserveAndEnqueue(T* InObjectData, std::size_t Count)
+		{
+			if (!HasCapacityFor(Count)) return false;
+
+			std::size_t index = 0;
+
+			while (index < Count)
+			{
+				m_data[m_tail] = std::move(*InObjectData);
+				m_tail = (m_tail + 1) % Capacity;
+
+				++InObjectData;
+				++index;
+			}
+
+			return true;
+		}
+
+
+		// Returns true if buffer has capacity greater or equal to Length, false otherwise
+		bool HasCapacityFor(std::size_t Count) const
+		{
+			std::size_t freeSpace = (Capacity - 1) - GetSize();
+
+			return freeSpace > Count;
 		}
 
 		// Increments the Head and frees the index at the Front of the Queue
@@ -302,12 +339,12 @@ namespace Neyrx
 
 		const T& Peek(std::size_t Index) const
 		{
-			assert(Index > 0 && Index < GetSize());
+			assert(Index < GetSize());
 
 			return m_data[LogicalIndexToPhysicalIndex(Index)];
 		}
 
-		std::size_t LogicalIndexToPhysicalIndex(std::size_t Index)
+		std::size_t LogicalIndexToPhysicalIndex(std::size_t Index) const
 		{
 			return (m_head + Index) % Capacity;
 		}

@@ -9,6 +9,90 @@ using namespace Neyrx::Logger;
 
 
 // ==========================================================================================================
+// Log Arena
+// ==========================================================================================================
+
+void LogArena::Initialize()
+{
+
+}
+
+
+
+
+void LogArena::Reset()
+{
+	m_arenaBuffer.get()->Reset();
+}
+
+
+
+
+std::size_t LogArena::GetSize() const
+{
+	return m_arenaBuffer.get()->GetSize();
+}
+
+
+
+
+std::size_t LogArena::GetArenaStart() const
+{
+	return m_arenaBuffer.get()->FrontIndex();
+}
+
+
+
+
+std::size_t LogArena::GetArenaEnd() const
+{
+	return m_arenaBuffer.get()->BackIndex();
+}
+
+
+
+
+bool LogArena::IsEmpty() const
+{
+	return m_arenaBuffer.get()->IsEmpty();
+}
+
+
+
+
+bool LogArena::IsFull() const
+{
+	return m_arenaBuffer.get()->IsFull();
+}
+
+
+
+
+bool LogArena::WriteToArena(const char* InData, std::size_t InLength, std::size_t& OutOffset)
+{
+	return m_arenaBuffer.get()->ReserveAndEnqueue(const_cast<char*>(InData), InLength);
+}
+
+
+
+
+char* LogArena::GetHeadData()
+{
+	return &m_arenaBuffer.get()->Front();
+}
+
+
+
+
+bool LogArena::HasCapacityFor(std::size_t InLength) const
+{
+	return m_arenaBuffer.get()->HasCapacityFor(InLength);
+}
+
+
+
+
+// ==========================================================================================================
 // Ordered Log Buffer
 // ==========================================================================================================
 

@@ -31,7 +31,6 @@ namespace Neyrx::Logger
 
 		inline virtual void Publish(const LogData& InLogData) override
 		{
-			InLogData.PrintData();
 		}
 	};
 }

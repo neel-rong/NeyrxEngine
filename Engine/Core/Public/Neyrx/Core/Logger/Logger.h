@@ -38,8 +38,57 @@ namespace Neyrx::Logger
 		uint64_t GetSkippedCount();
 		bool IsIdle() const;
 
-		void QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string InMsg);
 		void TryAndPublishLogData();
+
+
+
+
+		// Queue Message ------------------------------------------------------------------------------------------------------------
+		template<FixedString Format, typename... Args>
+		void QueueMessage(LogCategory InCategory, LogLevel InLevel, Args&&... InArgs)
+		{
+			// TODO - uncomment after development
+			/*LogThreadContext* context = GetLogThreadContext();
+
+			while (context->ThreadQueue.IsFull())
+			{
+				std::this_thread::yield();
+			}*/
+
+			using Holder = LogFormatMetadataHolder<Format>;
+
+			constexpr auto ArgumentCount = GetSpecifierCount<Format>();
+
+			static_assert(sizeof...(Args) == ArgumentCount,
+				"Format specifier count does not match argument count");
+
+			static_assert(ArgumentCount <= 8,
+				"Argument count exceeded limit of 8");
+
+
+			const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+
+			uint64_t sequenceNumber = m_globalSequenceNumber.fetch_add(1, std::memory_order_relaxed);
+
+			if (!g_threadContext->ThreadQueue.Enqueue(LogData(sequenceNumber,
+				InCategory,
+				InLevel,
+				Holder::FormatString.Value,
+				Holder::Metadata.Operations.data(),
+				Holder::Metadata.OperationCount,
+				Holder::Metadata.ArgumentCount,
+				std::forward<Args>(InArgs)...)
+				))
+			{
+				std::cout << "Queue Failed for Seq: " << sequenceNumber << "\n";
+			}
+
+			const std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+
+			const auto& duration = end - start;
+			if (duration > std::chrono::milliseconds(1))
+				std::cout << "Queue Duration: " << duration << "\n";
+		}
 
 	private:
 
@@ -76,4 +125,4 @@ extern Neyrx::Logger::Logger NX_Logger;
 
 #define NX_LOG_TEMP Neyrx::Logger::LogCategory::Temp
 
-#define NX_LOG(CATEGORY, LEVEL, LOGMSG)  NX_Logger.QueueMessage(CATEGORY, LEVEL, LOGMSG);
+#define NX_LOG(CATEGORY, LEVEL, FORMAT, ...)  NX_Logger.QueueMessage<FORMAT>(CATEGORY, LEVEL, __VA_ARGS__);

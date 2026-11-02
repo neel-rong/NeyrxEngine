@@ -80,33 +80,6 @@ LogThreadContext* Logger::GetLogThreadContext()
 
 
 
-void Logger::QueueMessage(LogCategory InCategory, LogLevel InLevel, std::string InMsg)
-{
-	/*LogThreadContext* context = GetLogThreadContext();
-
-	while (context->ThreadQueue.IsFull())
-	{
-		std::this_thread::yield();
-	}*/
-	const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-
-	uint64_t sequenceNumber = m_globalSequenceNumber.fetch_add(1, std::memory_order_relaxed);
-
-	if (!g_threadContext->ThreadQueue.Enqueue(LogData(std::this_thread::get_id(), sequenceNumber, InCategory, InLevel, InMsg)))
-	{
-		std::cout << "Queue Failed for Seq: " << sequenceNumber << "\n";
-	}
-
-	const std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-
-	const auto& duration = end - start;
-	if (duration > std::chrono::milliseconds(1))
-	std::cout << "Queue Duration: " << duration << "\n";
-}
-
-
-
-
 void Logger::TryAndPublishLogData()
 {
 	// Call reserve Slot at the start of every functionCall

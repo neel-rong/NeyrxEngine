@@ -45,10 +45,7 @@ inline static thread_local MsgCount g_msgCount;
 
 void InputLog(int& count)
 {
-	std::ostringstream oss;
-	oss << "Hello from Thread ID: " << std::this_thread::get_id() << " | Msg Id: " << count;
-
-	NX_LOG(Neyrx::Logger::LogCategory::Temp, Neyrx::Logger::LogLevel::Info, oss.str());
+	NX_LOG(NX_LOG_TEMP, NX_LOG_INFO, "Hello from thread ID: %d", 1);
 
 	count++;
 }

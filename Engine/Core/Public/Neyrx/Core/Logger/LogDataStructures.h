@@ -3,6 +3,16 @@
 #include<string>
 #include<chrono>
 #include<array>
+#include <cstddef>
+#include <string_view>
+#include <type_traits>
+#include <charconv>
+#include <stdexcept>
+#include <cstdio>
+#include <tuple>
+#include <utility>
+#include <concepts>
+
 
 #include "Neyrx/Core/Container/Queue.h"
 
@@ -19,7 +29,10 @@ inline constexpr uint64_t Invalidindex = std::numeric_limits<uint64_t>::max();
 inline constexpr std::size_t NumberOfThreads = 8;
 inline constexpr std::size_t ThreadQueueSize = 16384;
 
+inline constexpr std::size_t MaxLogArguments = 8;
+
 inline constexpr std::size_t g_OrderedLogCapacity = ThreadQueueSize * NumberOfThreads;
+inline constexpr std::size_t g_estimatedLogStringSize = 256;
 
 
 namespace Neyrx::Logger
@@ -77,6 +90,43 @@ namespace Neyrx::Logger
 		FAILURE_INVALID_SEQUENCE,
 
 		INVALID_INTERNAL_STATE
+	};
+
+
+
+
+	// ==========================================================================================================
+	// Format Operation Type
+	// ==========================================================================================================
+	enum class LogFormatOpType
+	{
+		Integer,
+		Float,
+		Double,
+		Boolean,
+		Literal,
+		Pointer,
+		EscapedPercent
+
+	};
+
+
+
+
+	// ==========================================================================================================
+	// Log Argument Type
+	// ==========================================================================================================
+	enum class LogArgumentType
+	{
+		SignedInteger,
+		UnsignedInteger,
+		Float,
+		Double,
+		Boolean,
+		Character,
+		StringLiteral,
+		Pointer,
+		Invalid
 	};
 
 
@@ -143,6 +193,379 @@ X(Temp)						\
 
 
 
+	// ==========================================================================================================
+	// Fixed String
+	// ==========================================================================================================
+
+	template<std::size_t N>
+	struct FixedString
+	{
+		// Always needs compile time evaluation
+		// for compile time format-string validation later in the pipeline
+		consteval FixedString(const char(&String)[N])
+		{
+			for (std::size_t i = 0; i < N; ++i)
+			{
+				Value[i] = String[i];
+			}
+		}
+
+
+		constexpr std::size_t size() const
+		{
+			return N - 1;
+		}
+
+		constexpr std::string_view StringView() const
+		{
+			return { Value, N - 1 };
+		}
+
+		char Value[N];
+	};
+
+
+
+
+	// ==========================================================================================================
+	// Log Format Operations
+	// ==========================================================================================================
+
+	struct LogFormatOperation
+	{
+		LogFormatOpType Type = LogFormatOpType::Literal;
+		std::size_t Offset = 0;
+		std::size_t Length = 0;
+		std::size_t ArgumentIndex = 0;
+	};
+
+
+
+
+	// ==========================================================================================================
+	// Get Operations Count
+	// ==========================================================================================================
+
+	template<FixedString Format>
+	consteval std::size_t GetOperationsCount()
+	{
+		std::size_t count = 0;
+		std::size_t index = 0;
+		std::size_t offset = 0;
+
+		while (index < Format.size())
+		{
+			// iterate till a format specifier is found
+			if (Format.Value[index] != '%')
+			{
+				++index;
+				continue;
+			}
+
+			if (index + 1 >= Format.size())
+			{
+				throw "Invalid log format";
+			}
+
+			// If there is a string literal before the format specifier, increment count
+			if (index > offset)
+			{
+				++count;
+			}
+
+			// Increment count for format specifier
+			++count;
+
+			// Increment index and update offset to skip the format specifier
+			index += 2;
+			offset = index;
+		}
+
+		// Increment for trailing literal, if any
+		if (offset < Format.size()) ++count;
+
+		return count;
+	}
+
+
+
+
+	// ==========================================================================================================
+	// Get Specifier Count
+	// ==========================================================================================================
+
+	template<FixedString Format>
+	consteval std::size_t GetSpecifierCount()
+	{
+		std::size_t count = 0;
+		for (std::size_t i = 0; i < Format.size(); ++i)
+		{
+			if (Format.Value[i] != '%')
+			{
+				continue;
+			}
+			else if (i + 1 > Format.size())
+			{
+				throw "Invalid Log format";
+			}
+
+			++count;
+		}
+
+		return count;
+	}
+
+
+
+
+	// ==========================================================================================================
+	// Log Metadata
+	// ==========================================================================================================
+
+	template<FixedString Format>
+	struct LogMetadata
+	{
+		std::array<LogFormatOperation, GetOperationsCount<Format>()> Operations{};
+		std::array<LogArgumentType, GetSpecifierCount<Format>()> ArgumentTypes{};
+		std::size_t OperationCount = 0;
+		std::size_t ArgumentCount = 0;
+	};
+
+
+
+
+	// ==========================================================================================================
+	// Get Log Argument Type
+	// ==========================================================================================================
+
+	template <typename T>
+	consteval LogArgumentType GetLogArgumentType()
+	{
+		using Type = std::remove_cvref_t<T>;
+
+
+		if constexpr (std::is_same_v<Type, bool>)
+		{
+			return LogArgumentType::Boolean;
+		}
+		else if constexpr (std::is_integral_v<Type> && std::is_signed_v<Type>)
+		{
+			return LogArgumentType::SignedInteger;
+		}
+		else if constexpr (std::is_integral_v<Type> && std::is_unsigned_v<Type>)
+		{
+			return LogArgumentType::UnsignedInteger;
+		}
+		else if constexpr (std::is_same_v<Type, float>)
+		{
+			return LogArgumentType::Float;
+		}
+		else if constexpr (std::is_same_v<Type, double>)
+		{
+			return LogArgumentType::Double;
+		}
+		else if constexpr (std::is_same_v<Type, char>)
+		{
+			return LogArgumentType::Character;
+		}
+		else if constexpr (std::is_same_v<Type, const char*>)
+		{
+			return LogArgumentType::StringLiteral;
+		}
+		else if constexpr (std::is_pointer_v<Type>)
+		{
+			return LogArgumentType::Pointer;
+		}
+		else
+		{
+			static_assert(!sizeof(Type), "Unsupported log argument type");
+			return LogArgumentType::Invalid; // Default return to satisfy compiler
+		}
+	}
+
+
+
+
+	// ==========================================================================================================
+	// Parse Log Format
+	// ==========================================================================================================
+
+	template <FixedString Format, typename... Args>
+	consteval auto ParseFormat()
+	{
+		LogMetadata<Format> metadata;
+		constexpr std::array<LogArgumentType, sizeof...(Args)> arguments{
+			GetLogArgumentType<Args>()...
+		};
+
+		std::size_t offset = 0;
+
+		std::size_t index = 0;
+
+		while (index < Format.size())
+		{
+			if (Format.Value[index] != '%')
+			{
+				++index;
+				continue;
+			}
+
+			if (index + 1 >= Format.size())
+			{
+				throw "Invalid log format";
+			}
+
+			if (index > offset)
+			{
+				metadata.Operations[metadata.OperationCount++] =
+				{
+					LogFormatOpType::Literal,
+					offset,
+					index - offset,
+					0
+				};
+			}
+
+			offset = index + 2;
+
+			const char specifier = Format.Value[index + 1];
+
+			if (specifier != '%')
+			{
+				if (metadata.ArgumentCount >= sizeof...(Args))
+				{
+					throw "Invalid log format: Argument count mismatch";
+				}
+
+				auto argumentType = std::remove_cvref_t<decltype(arguments[metadata.ArgumentCount])>();
+
+				LogFormatOpType type;
+
+				if ((specifier == 'd' && argumentType == LogArgumentType::SignedInteger) ||
+					(specifier == 'u' && argumentType == LogArgumentType::UnsignedInteger))
+				{
+					type = LogFormatOpType::Integer;
+				}
+				else if (specifier == 'f' && argumentType == LogArgumentType::Float)
+				{
+					type = LogFormatOpType::Float;
+				}
+				else if (specifier == 'l' && argumentType == LogArgumentType::Double)
+				{
+					type = LogFormatOpType::Double;
+				}
+				else if (specifier == 'b' && argumentType == LogArgumentType::Boolean)
+				{
+					type = LogFormatOpType::Boolean;
+				}
+				else if ((specifier == 's' && argumentType == LogArgumentType::StringLiteral) ||
+					(specifier == 'c' && argumentType == LogArgumentType::Character))
+				{
+					type = LogFormatOpType::Literal;
+				}
+				else if (specifier == 'p' && argumentType == LogArgumentType::Pointer)
+				{
+					type = LogFormatOpType::Pointer;
+				}
+				else
+				{
+					throw "Invalid specifier";
+				}
+
+				metadata.Operations[metadata.OperationCount++] =
+				{
+					type,
+					index,
+					2,
+					metadata.ArgumentCount
+				};
+
+				metadata.ArgumentTypes[metadata.ArgumentCount++] = argumentType;
+			}
+			else
+			{
+				metadata.Operations[metadata.OperationCount++] =
+				{
+					LogFormatOpType::EscapedPercent,
+					index,
+					2,
+					0
+				};
+			}
+
+			if (index + 2 >= Format.size())
+			{
+				break;
+			}
+
+			index += 2;
+		}
+
+		if (offset < Format.size())
+		{
+			metadata.Operations[metadata.OperationCount++] =
+			{
+				LogFormatOpType::Literal,
+				index,
+				Format.size() - offset,
+				0
+			};
+		}
+
+		return metadata;
+	}
+
+
+
+
+	// ==========================================================================================================
+	// Log Format Metadata Holder
+	// ==========================================================================================================
+
+	template<FixedString Format, typename... Args>
+	struct LogFormatMetadataHolder
+	{
+		static constexpr auto FormatString = Format;
+		static constexpr auto Metadata = ParseFormat<Format, Args...>();
+	};
+
+
+
+
+	// ==========================================================================================================
+	// Log Argument Value
+	// ==========================================================================================================
+
+	union LogArgumentValue
+	{
+		int64_t SignedInteger;
+		uint64_t UnsignedInteger;
+		float FloatValue;
+		double DoubleValue;
+		bool BooleanValue;
+		char Character;
+		const char* StringLiteral;
+		void* Pointer;
+
+		constexpr LogArgumentValue() :
+			UnsignedInteger(0) { }
+	};
+
+
+
+
+	// ==========================================================================================================
+	// Log Argument
+	// ==========================================================================================================
+
+	struct LogArgument
+	{
+		LogArgumentType ArgType = LogArgumentType::UnsignedInteger;
+		LogArgumentValue ArgValue{};
+	};
+
+
+
 
 	// ==========================================================================================================
 	// Log Data
@@ -158,29 +581,144 @@ X(Temp)						\
 		LogData& operator=(const LogData&) = default;
 		LogData& operator=(LogData&&) noexcept = default;
 
-		LogData(std::thread::id InThreadID, uint64_t InSequenceNumber, LogCategory InCategory, LogLevel InLevel, std::string InLogMsg) :
-			ThreadID(InThreadID),
+		LogData(uint64_t InSequenceNumber,
+				LogCategory InCategory,
+				LogLevel InLevel,
+				const char* InLogStr,
+				const std::size_t InOperationCount,
+				const std::size_t InArgumentCount) :
+			ThreadID(std::this_thread::get_id()),
 			Sequence(InSequenceNumber),
 			Category(InCategory),
 			Level(InLevel),
-			Message(std::move(InLogMsg)),
+			LogFormatString(InLogStr),
+			OperationCount(InOperationCount),
+			ArgumentCount(InArgumentCount),
 			Time(std::chrono::system_clock::now())
 		{
 		}
 
-		inline void PrintData()	const	// Temporary
+		template <typename... Args>
+		LogData(uint64_t InSequenceNumber,
+				LogCategory InCategory,
+				LogLevel InLevel,
+				const char* InLogStr,
+				const LogFormatOperation* InLogFormatOperations,
+				const std::size_t InOperationCount,
+				const std::size_t InArgumentCount,
+				Args&&... InArguments)	:
+			Sequence(InSequenceNumber),
+			Category(InCategory),
+			Level(InLevel),
+			LogFormatString(InLogStr),
+			LogOperations(InLogFormatOperations),
+			OperationCount(InOperationCount),
+			ArgumentCount(InArgumentCount),
+			ThreadID(std::this_thread::get_id()),
+			Time(std::chrono::system_clock::now())
 		{
-			std::cout << "[ TheradID: " << ThreadID << "] " << "[ " << Sequence << " ] [ " << ToString(Category) << " ] [ " << ToString(Level) << "]  " << Message << std::endl;
+			std::size_t index = 0;
+			(StoreArguments(index++, std::forward<Args>(InArguments)), ...);
+		}
+
+		template<typename Arg>
+		void StoreArguments(std::size_t Index, Arg&& InArgument)
+		{
+			using Type = std::remove_cvref_t<Arg>;
+			auto& destination = LogArguments[Index];
+
+			if constexpr (std::is_same_v<Type, bool>)
+			{
+				destination.ArgType = LogArgumentType::Boolean;
+				destination.ArgValue.BooleanValue = InArgument;
+			}
+			else if constexpr (std::is_integral_v<Type> && std::is_signed_v<Type>)
+			{
+				destination.ArgType = LogArgumentType::SignedInteger;
+				destination.ArgValue.SignedInteger = InArgument;
+			}
+			else if constexpr (std::is_integral_v<Type> && std::is_unsigned_v<Type>)
+			{
+				destination.ArgType = LogArgumentType::UnsignedInteger;
+				destination.ArgValue.UnsignedInteger = InArgument;
+			}
+			else if constexpr (std::is_same_v<Type, float>)
+			{
+				destination.ArgType = LogArgumentType::Float;
+				destination.ArgValue.FloatValue = InArgument;
+			}
+			else if constexpr (std::is_same_v<Type, double>)
+			{
+				destination.ArgType = LogArgumentType::Double;
+				destination.ArgValue.DoubleValue = InArgument;
+			}
+			else if constexpr (std::is_same_v<Type, char>)
+			{
+				destination.ArgType = LogArgumentType::Character;
+				destination.ArgValue.Character = InArgument;
+			}
+			else
+			{
+				static_assert(!sizeof(Type), "Unsupported log argument type");
+			}
 		}
 
 		std::thread::id ThreadID;
 		uint64_t Sequence = InvalidSequenceNumber;
 		LogCategory Category = LogCategory::Temp;
 		LogLevel Level = LogLevel::Info;
-		std::string Message = "";
+
+		const char* LogFormatString = nullptr;
+		const LogFormatOperation* LogOperations = nullptr;
+		std::array<LogArgument, MaxLogArguments> LogArguments{};
+
+		std::size_t OperationCount = 0;
+		std::size_t ArgumentCount = 0;
 
 		std::chrono::system_clock::time_point Time = std::chrono::system_clock::now();
 	};
+
+
+
+
+	// ==========================================================================================================
+	// Log Arena
+	// ==========================================================================================================
+
+	struct LogArena
+	{
+	public:
+
+		LogArena() = default;
+
+		void Initialize();
+		void Reset();
+
+		std::size_t GetSize() const;
+		std::size_t GetArenaStart() const;
+		std::size_t GetArenaEnd() const;
+		bool IsEmpty() const;
+		bool IsFull() const;
+
+		bool WriteToArena(const char* InData, std::size_t InLength, std::size_t& OutOffset);
+		char* GetHeadData();
+
+	private:
+
+		bool HasCapacityFor(std::size_t InLength) const;
+
+		// Private Members
+
+		using BufferType = RingBuffer<char, g_OrderedLogCapacity* g_estimatedLogStringSize>;
+
+		std::unique_ptr<BufferType> m_arenaBuffer = std::make_unique_for_overwrite<BufferType>();
+
+		bool bInitialized = 0;
+	};
+
+
+
+
 
 
 
@@ -445,10 +983,25 @@ X(Temp)						\
 		LogReserveState ReserveLogSlotsForTracking();
 
 
-
 		// ---------------------------------------------------------------------------------------------------------------------------
 		// Template Functions --------------------------------------------------------------------------------------------------------
 		// ---------------------------------------------------------------------------------------------------------------------------
+
+		// Execute Log Format Operations Recurssive ----------------------------------------------------------------------------------
+
+		template<typename Tuple>
+		bool ExecuteLogFormatOperations_Recurssive(const char* FormatString,
+			Tuple Arguments,
+			const LogFormatOperation* FormatOperations,
+			std::size_t OperationCount,
+			std::size_t ArgumentCount,
+			std::size_t OperationIndex = 0)
+		{
+
+		}
+
+
+
 
 		// Track Log Data ------------------------------------------------------------------------------------------------------------
 
@@ -623,6 +1176,11 @@ X(Temp)						\
 
 
 
+		// Format Log Data -----------------------------------------------------------------------------------------------------------
+
+
+
+
 
 		// Publish Log Data ----------------------------------------------------------------------------------------------------------
 		template <typename Publisher>
@@ -659,8 +1217,8 @@ X(Temp)						\
 				if (data == nullptr)
 				{
 					//std::cout << "Null Data found in OrderedLogBuffer" << std::endl;
-					MissingDataTemplate.Sequence = expected;
-					PublishFunction(MissingDataTemplate);
+					/*MissingDataTemplate.Sequence = expected;
+					PublishFunction(MissingDataTemplate);*/
 					++m_skippedLogCount;
 				}
 				else
@@ -768,6 +1326,7 @@ X(Temp)						\
 		TrackedLogData m_trackedData;
 
 		OrderedLogBuffer m_orderedLogBuffer;
+		LogArena m_logArena;
 
 		std::size_t m_cursorStart = 0;
 		std::size_t m_cursorEnd = 0;
@@ -776,7 +1335,7 @@ X(Temp)						\
 
 		LoggerThreadRegistry* m_loggerRegistryPointer = nullptr;
 
-		LogData MissingDataTemplate{ std::this_thread::get_id(), 0, Neyrx::Logger::LogCategory::Temp, Neyrx::Logger::LogLevel::Warning, "MISSING SEQUENCE NUMBER"};
+		//LogData MissingDataTemplate{0, Neyrx::Logger::LogCategory::Temp, Neyrx::Logger::LogLevel::Warning, "MISSING SEQUENCE NUMBER"};
 
 		uint64_t m_lastPublishSequence = InvalidSequenceNumber;
 		uint64_t m_invertedLogCount = 0;
