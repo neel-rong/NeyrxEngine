@@ -12,9 +12,10 @@
 #include <tuple>
 #include <utility>
 #include <concepts>
-
+#include <limits>
 
 #include "Neyrx/Core/Container/Queue.h"
+#include "Neyrx/Time/NX_Time.h"
 
 
 #include <stdio.h>			// Temp
@@ -33,6 +34,9 @@ inline constexpr std::size_t MaxLogArguments = 8;
 
 inline constexpr std::size_t g_OrderedLogCapacity = ThreadQueueSize * NumberOfThreads;
 inline constexpr std::size_t g_estimatedLogStringSize = 256;
+
+
+using namespace Neyrx::Time;
 
 
 namespace Neyrx::Logger
@@ -100,11 +104,14 @@ namespace Neyrx::Logger
 	// ==========================================================================================================
 	enum class LogFormatOpType
 	{
-		Integer,
+		FormatLiteral,
+		SignedInteger,
+		UnsignedInteger,
 		Float,
 		Double,
 		Boolean,
-		Literal,
+		Character,
+		ArgumentLiteral,
 		Pointer,
 		EscapedPercent
 
@@ -233,7 +240,7 @@ X(Temp)						\
 
 	struct LogFormatOperation
 	{
-		LogFormatOpType Type = LogFormatOpType::Literal;
+		LogFormatOpType Type = LogFormatOpType::FormatLiteral;
 		std::size_t Offset = 0;
 		std::size_t Length = 0;
 		std::size_t ArgumentIndex = 0;
@@ -313,6 +320,36 @@ X(Temp)						\
 		}
 
 		return count;
+	}
+
+
+
+
+	// ==========================================================================================================
+	// Log Metadata
+	// ==========================================================================================================
+
+	template<typename T>
+	constexpr std::size_t GetToCharsBufferSize()
+	{
+		using Type = std::remove_cvref_t<T>;
+
+		if constexpr (std::integral<Type> && !std::same_as<Type, bool>)
+		{
+			return std::numeric_limits<Type>::digits10 + 3;
+		}
+		else if constexpr (std::same_as<Type, float>)
+		{
+			return 64;
+		}
+		else if constexpr (std::same_as<Type, double>)
+		{
+			return 128;
+		}
+		else
+		{
+			static_assert(!sizeof(Type), "Unsupported numeric type");
+		}
 	}
 
 
@@ -419,7 +456,7 @@ X(Temp)						\
 			{
 				metadata.Operations[metadata.OperationCount++] =
 				{
-					LogFormatOpType::Literal,
+					LogFormatOpType::FormatLiteral,
 					offset,
 					index - offset,
 					0
@@ -441,10 +478,13 @@ X(Temp)						\
 
 				LogFormatOpType type;
 
-				if ((specifier == 'd' && argumentType == LogArgumentType::SignedInteger) ||
-					(specifier == 'u' && argumentType == LogArgumentType::UnsignedInteger))
+				if (specifier == 'd' && argumentType == LogArgumentType::SignedInteger)
 				{
-					type = LogFormatOpType::Integer;
+					type = LogFormatOpType::SignedInteger;
+				}
+				else if (specifier == 'u' && argumentType == LogArgumentType::UnsignedInteger)
+				{
+					type = LogFormatOpType::UnsignedInteger;
 				}
 				else if (specifier == 'f' && argumentType == LogArgumentType::Float)
 				{
@@ -458,10 +498,13 @@ X(Temp)						\
 				{
 					type = LogFormatOpType::Boolean;
 				}
-				else if ((specifier == 's' && argumentType == LogArgumentType::StringLiteral) ||
-					(specifier == 'c' && argumentType == LogArgumentType::Character))
+				else if (specifier == 'c' && argumentType == LogArgumentType::Character)
 				{
-					type = LogFormatOpType::Literal;
+					type = LogFormatOpType::Character;
+				}
+				else if (specifier == 's' && argumentType == LogArgumentType::StringLiteral)
+				{
+					type = LogFormatOpType::ArgumentLiteral;
 				}
 				else if (specifier == 'p' && argumentType == LogArgumentType::Pointer)
 				{
@@ -505,7 +548,7 @@ X(Temp)						\
 		{
 			metadata.Operations[metadata.OperationCount++] =
 			{
-				LogFormatOpType::Literal,
+				LogFormatOpType::FormatLiteral,
 				index,
 				Format.size() - offset,
 				0
@@ -594,7 +637,7 @@ X(Temp)						\
 			LogFormatString(InLogStr),
 			OperationCount(InOperationCount),
 			ArgumentCount(InArgumentCount),
-			Time(std::chrono::system_clock::now())
+			Time(NX_Clock::now())
 		{
 		}
 
@@ -615,7 +658,7 @@ X(Temp)						\
 			OperationCount(InOperationCount),
 			ArgumentCount(InArgumentCount),
 			ThreadID(std::this_thread::get_id()),
-			Time(std::chrono::system_clock::now())
+			Time(NX_Clock::now())
 		{
 			std::size_t index = 0;
 			(StoreArguments(index++, std::forward<Args>(InArguments)), ...);
@@ -675,7 +718,7 @@ X(Temp)						\
 		std::size_t OperationCount = 0;
 		std::size_t ArgumentCount = 0;
 
-		std::chrono::system_clock::time_point Time = std::chrono::system_clock::now();
+		NX_TimePoint Time = NX_Clock::now();
 	};
 
 
@@ -697,11 +740,62 @@ X(Temp)						\
 		std::size_t GetSize() const;
 		std::size_t GetArenaStart() const;
 		std::size_t GetArenaEnd() const;
+		char* GetHeadData();
+
 		bool IsEmpty() const;
 		bool IsFull() const;
 
-		bool WriteToArena(const char* InData, std::size_t InLength, std::size_t& OutOffset);
-		char* GetHeadData();
+		bool AppendToArena_Literal(const char* InData, std::size_t InLength);
+
+		template<typename Number>
+			requires (
+		(std::integral<std::remove_cvref_t<Number>> &&
+			!std::same_as<std::remove_cvref_t<Number>, bool>) ||
+		std::floating_point<std::remove_cvref_t<Number>>)
+		bool AppendToArena_Numeric(
+			const Number& InNumber,
+			const int Base = 10,
+			const std::chars_format Format = std::chars_format::general)
+		{
+			using Type = std::remove_cvref_t<Number>;
+
+			constexpr std::size_t reqSize = GetToCharsBufferSize<Type>();
+			static_assert(reqSize <= m_formatBufferSize);
+
+			auto* fBuffer = m_numericFormatBuffer.data();
+
+			std::to_chars_result result{};
+
+			if constexpr (std::integral<Type>)
+			{
+				if (Base < 2 || Base > 36)
+					return false;
+
+				result = std::to_chars(fBuffer,
+					fBuffer + reqSize,
+					InNumber,
+					Base);
+			}
+			else if constexpr (std::floating_point<Type>)
+			{
+				result = std::to_chars(fBuffer,
+					fBuffer + reqSize,
+					InNumber,
+					Format);
+			}
+
+			if (result.ec != std::errc{})
+			{
+				__debugbreak();
+				return false;
+			}
+
+			const std::size_t written = static_cast<std::size_t>(result.ptr - fBuffer);
+
+			if (!HasCapacityFor(written)) return false;
+
+			return AppendToArena_Literal(fBuffer, written);
+		}
 
 	private:
 
@@ -709,11 +803,10 @@ X(Temp)						\
 
 		// Private Members
 
-		using BufferType = RingBuffer<char, g_OrderedLogCapacity* g_estimatedLogStringSize>;
+		static constexpr std::size_t m_formatBufferSize = 128;
 
-		std::unique_ptr<BufferType> m_arenaBuffer = std::make_unique_for_overwrite<BufferType>();
-
-		bool bInitialized = 0;
+		RingBuffer<char, g_OrderedLogCapacity* g_estimatedLogStringSize> m_arenaBuffer{ };
+		std::array<char, m_formatBufferSize> m_numericFormatBuffer{ };
 	};
 
 
@@ -908,6 +1001,7 @@ X(Temp)						\
 		uint64_t GetEndReservedSequenceNumber() const;
 		uint64_t GetStartReservedSequenceNumber() const;
 		uint64_t GetMaxReservedSequenceNumber() const;
+		inline const auto& GetOrderedLogBuffers() const { return &OrderedLogBuffers; }
 
 		std::size_t GetSize() const;
 		bool IsEmpty() const;
@@ -989,15 +1083,141 @@ X(Temp)						\
 
 		// Execute Log Format Operations Recurssive ----------------------------------------------------------------------------------
 
-		template<typename Tuple>
-		bool ExecuteLogFormatOperations_Recurssive(const char* FormatString,
-			Tuple Arguments,
+		bool ExecuteLogFormatOperations(
+			const char* FormatString,
+			LogArgument* InArguments,
 			const LogFormatOperation* FormatOperations,
-			std::size_t OperationCount,
-			std::size_t ArgumentCount,
-			std::size_t OperationIndex = 0)
+			std::size_t OperationCount)
 		{
+			for (std::size_t OperationIndex = 0; OperationIndex < OperationCount; ++OperationIndex)
+			{
+				const auto& op = FormatOperations[OperationIndex];
 
+				switch (op.Type)
+				{
+				case LogFormatOpType::FormatLiteral:
+				{
+					if (!m_logArena.AppendToArena_Literal(FormatString + op.Offset, op.Length))
+						return false;
+
+					break;
+				}
+
+				case LogFormatOpType::SignedInteger :
+				{
+					if (!m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.SignedInteger))
+						return false;
+
+					break;
+				}
+
+				case LogFormatOpType::UnsignedInteger :
+				{
+					if (!m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.UnsignedInteger))
+						return false;
+
+					break;
+				}
+
+				case LogFormatOpType::Float :
+				{
+					if (!m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.FloatValue))
+						return false;
+
+					break;
+				}
+
+				case LogFormatOpType::Double :
+				{
+					if (!m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.DoubleValue))
+						return false;
+
+					break;
+				}
+
+				case LogFormatOpType::Boolean :
+				{
+					const bool value = InArguments[op.ArgumentIndex].ArgValue.BooleanValue;
+
+					if (!m_logArena.AppendToArena_Literal(
+						value ? "true" : "false",
+						value ? 4 : 5))
+					{
+						return false;
+					}
+
+					break;
+				}
+
+				case LogFormatOpType::Character :
+				{
+					const auto& character = InArguments[op.ArgumentIndex].ArgValue.Character;
+
+					if (!m_logArena.AppendToArena_Literal(&character, 1))
+						return false;
+
+					break;
+				}
+
+				case LogFormatOpType::ArgumentLiteral :
+				{
+					const auto& argument = InArguments[op.ArgumentIndex];
+					const char* string = argument.ArgValue.StringLiteral;
+
+					if (string == nullptr)
+					{
+						assert(false && "null string passed to logger");
+						return false;
+					}
+
+					const std::size_t length = std::char_traits<char>::length(string);
+
+					if (!m_logArena.AppendToArena_Literal(string, length)) return false;
+
+					break;
+				}
+
+				case LogFormatOpType::Pointer :
+				{
+					auto& argument = InArguments[op.ArgumentIndex];
+
+					if (argument.ArgValue.Pointer == nullptr)
+					{
+						if (!m_logArena.AppendToArena_Literal("nullptr", 7))
+							return false;
+					}
+					else
+					{
+						const auto pointer = reinterpret_cast<std::uintptr_t>(
+							argument.ArgValue.Pointer
+							);
+
+						if (!m_logArena.AppendToArena_Literal("0x", 2))
+							return false;
+
+						if (!m_logArena.AppendToArena_Numeric(pointer, 16))
+							return false;
+
+						break;
+					}
+				}
+
+				case LogFormatOpType::EscapedPercent :
+				{
+					if (!m_logArena.AppendToArena_Literal("%", 1))
+						return false;
+
+					break;
+				}
+
+				default :
+				{
+					throw "Invalid log format";
+				}
+				}
+			}
+
+			return true;
 		}
 
 
@@ -1178,7 +1398,46 @@ X(Temp)						\
 
 		// Format Log Data -----------------------------------------------------------------------------------------------------------
 
+		bool FormatLogDataToArena()
+		{
+			for (uint64_t seq = m_trackedData.Sequence_Begin; seq <= m_trackedData.Sequence_End; ++seq)
+			{
+				OrderedLogSlot* slot = m_orderedLogBuffer.GetReservedSlot(seq);
 
+				if (slot == nullptr)
+				{
+					assert(false && "Log Slot is null");
+					continue;
+				}
+
+				LogData* data = slot->Data;
+
+				if (data == nullptr)
+				{
+					assert(false && "Log Data is null");
+					continue;
+				}
+
+				const char* categoryString = ToString(data->Category).data();
+				const std::size_t categorySize = std::char_traits<char>::length(categoryString);
+
+				const char* levelString = ToString(data->Level).data();
+				const std::size_t levelSize = std::char_traits<char>::length(levelString);
+
+				const double logTimestamp = GetDurationMilliseconds(data->Time);
+				constexpr std::size_t timeStampSize = GetToCharsBufferSize<double>();
+
+				m_logArena.AppendToArena_Literal("[ ", 2);
+				m_logArena.AppendToArena_Literal(categoryString, categorySize);
+				m_logArena.AppendToArena_Literal(" ] [ ", 5);
+				m_logArena.AppendToArena_Literal(levelString, levelSize);
+				m_logArena.AppendToArena_Literal(" ] [ ", 5);
+				m_logArena.AppendToArena_Numeric(logTimestamp);
+
+				m_logArena.AppendToArena_Literal(" ", 5);
+				ExecuteLogFormatOperations(data->LogFormatString, data->LogArguments.data(), data->LogOperations, data->OperationCount);
+			}
+		}
 
 
 

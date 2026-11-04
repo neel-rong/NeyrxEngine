@@ -22,7 +22,7 @@ void LogArena::Initialize()
 
 void LogArena::Reset()
 {
-	m_arenaBuffer.get()->Reset();
+	m_arenaBuffer.Reset();
 }
 
 
@@ -30,7 +30,7 @@ void LogArena::Reset()
 
 std::size_t LogArena::GetSize() const
 {
-	return m_arenaBuffer.get()->GetSize();
+	return m_arenaBuffer.GetSize();
 }
 
 
@@ -38,7 +38,7 @@ std::size_t LogArena::GetSize() const
 
 std::size_t LogArena::GetArenaStart() const
 {
-	return m_arenaBuffer.get()->FrontIndex();
+	return m_arenaBuffer.FrontIndex();
 }
 
 
@@ -46,31 +46,7 @@ std::size_t LogArena::GetArenaStart() const
 
 std::size_t LogArena::GetArenaEnd() const
 {
-	return m_arenaBuffer.get()->BackIndex();
-}
-
-
-
-
-bool LogArena::IsEmpty() const
-{
-	return m_arenaBuffer.get()->IsEmpty();
-}
-
-
-
-
-bool LogArena::IsFull() const
-{
-	return m_arenaBuffer.get()->IsFull();
-}
-
-
-
-
-bool LogArena::WriteToArena(const char* InData, std::size_t InLength, std::size_t& OutOffset)
-{
-	return m_arenaBuffer.get()->ReserveAndEnqueue(const_cast<char*>(InData), InLength);
+	return m_arenaBuffer.BackIndex();
 }
 
 
@@ -78,7 +54,31 @@ bool LogArena::WriteToArena(const char* InData, std::size_t InLength, std::size_
 
 char* LogArena::GetHeadData()
 {
-	return &m_arenaBuffer.get()->Front();
+	return &m_arenaBuffer.Front();
+}
+
+
+
+
+bool LogArena::IsEmpty() const
+{
+	return m_arenaBuffer.IsEmpty();
+}
+
+
+
+
+bool LogArena::IsFull() const
+{
+	return m_arenaBuffer.IsFull();
+}
+
+
+
+
+bool LogArena::AppendToArena_Literal(const char* InData, std::size_t InLength)
+{
+	return m_arenaBuffer.ReserveAndEnqueue(const_cast<char*>(InData), InLength);
 }
 
 
@@ -86,7 +86,7 @@ char* LogArena::GetHeadData()
 
 bool LogArena::HasCapacityFor(std::size_t InLength) const
 {
-	return m_arenaBuffer.get()->HasCapacityFor(InLength);
+	return m_arenaBuffer.HasCapacityFor(InLength);
 }
 
 

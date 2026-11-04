@@ -55,7 +55,7 @@ namespace Neyrx::Logger
 				std::this_thread::yield();
 			}*/
 
-			using Holder = LogFormatMetadataHolder<Format>;
+			using Holder = LogFormatMetadataHolder<Format, Args...>;
 
 			constexpr auto ArgumentCount = GetSpecifierCount<Format>();
 
