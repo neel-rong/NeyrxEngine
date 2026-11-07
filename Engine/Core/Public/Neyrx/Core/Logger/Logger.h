@@ -77,6 +77,8 @@ namespace Neyrx::Logger
 				Holder::Metadata.Operations.data(),
 				Holder::Metadata.OperationCount,
 				Holder::Metadata.ArgumentCount,
+				Holder::Metadata.LogSize,
+				Holder::Metadata.StringArgumentCount,
 				std::forward<Args>(InArgs)...)
 				))
 			{

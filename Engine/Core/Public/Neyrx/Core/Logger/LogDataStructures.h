@@ -326,15 +326,23 @@ X(Temp)						\
 
 
 	// ==========================================================================================================
-	// Log Metadata
+	// Get To Chars Buffer Size
 	// ==========================================================================================================
 
 	template<typename T>
-	constexpr std::size_t GetToCharsBufferSize()
+	constexpr std::size_t GetMaxFormattedSize()
 	{
 		using Type = std::remove_cvref_t<T>;
 
-		if constexpr (std::integral<Type> && !std::same_as<Type, bool>)
+		if constexpr (std::same_as<Type, bool>)
+		{
+			return 5;
+		}
+		else if constexpr (std::same_as<Type, char>)
+		{
+			return 1;
+		}
+		else if constexpr (std::integral<Type>)
 		{
 			return std::numeric_limits<Type>::digits10 + 3;
 		}
@@ -345,6 +353,10 @@ X(Temp)						\
 		else if constexpr (std::same_as<Type, double>)
 		{
 			return 128;
+		}
+		else if constexpr (std::is_pointer_v<Type>)
+		{
+			return 18;
 		}
 		else
 		{
@@ -366,6 +378,8 @@ X(Temp)						\
 		std::array<LogArgumentType, GetSpecifierCount<Format>()> ArgumentTypes{};
 		std::size_t OperationCount = 0;
 		std::size_t ArgumentCount = 0;
+		std::size_t LogSize = 0;
+		std::size_t StringArgumentCount = 0;
 	};
 
 
@@ -434,6 +448,9 @@ X(Temp)						\
 		constexpr std::array<LogArgumentType, sizeof...(Args)> arguments{
 			GetLogArgumentType<Args>()...
 		};
+		constexpr std::array<std::size_t, sizeof...(Args)> argumentSizes{
+					GetMaxFormattedSize<Args>()...
+		};
 
 		std::size_t offset = 0;
 
@@ -443,6 +460,7 @@ X(Temp)						\
 		{
 			if (Format.Value[index] != '%')
 			{
+				++metadata.LogSize;
 				++index;
 				continue;
 			}
@@ -474,7 +492,7 @@ X(Temp)						\
 					throw "Invalid log format: Argument count mismatch";
 				}
 
-				auto argumentType = std::remove_cvref_t<decltype(arguments[metadata.ArgumentCount])>();
+				const auto argumentType = arguments[metadata.ArgumentCount];
 
 				LogFormatOpType type;
 
@@ -515,6 +533,17 @@ X(Temp)						\
 					throw "Invalid specifier";
 				}
 
+
+				// Account for the actual string length in runtime preflight
+				if (argumentType != LogArgumentType::StringLiteral)
+				{
+					metadata.LogSize += argumentSizes[metadata.ArgumentCount];
+				}
+				else
+				{
+					++metadata.StringArgumentCount;
+				}
+
 				metadata.Operations[metadata.OperationCount++] =
 				{
 					type,
@@ -534,6 +563,8 @@ X(Temp)						\
 					2,
 					0
 				};
+
+				++metadata.LogSize;
 			}
 
 			if (index + 2 >= Format.size())
@@ -549,11 +580,15 @@ X(Temp)						\
 			metadata.Operations[metadata.OperationCount++] =
 			{
 				LogFormatOpType::FormatLiteral,
-				index,
+				offset,
 				Format.size() - offset,
 				0
 			};
+
+			metadata.LogSize += Format.size() - offset;
 		}
+
+		++metadata.LogSize; // Add 1 for line ending
 
 		return metadata;
 	}
@@ -629,7 +664,9 @@ X(Temp)						\
 				LogLevel InLevel,
 				const char* InLogStr,
 				const std::size_t InOperationCount,
-				const std::size_t InArgumentCount) :
+				const std::size_t InArgumentCount,
+				const std::size_t InLogSize,
+				const std::size_t InStringArgumentCount) :
 			ThreadID(std::this_thread::get_id()),
 			Sequence(InSequenceNumber),
 			Category(InCategory),
@@ -637,6 +674,8 @@ X(Temp)						\
 			LogFormatString(InLogStr),
 			OperationCount(InOperationCount),
 			ArgumentCount(InArgumentCount),
+			LogSize(InLogSize),
+			StringArgumentCount(InStringArgumentCount),
 			Time(NX_Clock::now())
 		{
 		}
@@ -649,6 +688,8 @@ X(Temp)						\
 				const LogFormatOperation* InLogFormatOperations,
 				const std::size_t InOperationCount,
 				const std::size_t InArgumentCount,
+				const std::size_t InLogSize,
+				const std::size_t InStringArgumentCount,
 				Args&&... InArguments)	:
 			Sequence(InSequenceNumber),
 			Category(InCategory),
@@ -657,6 +698,8 @@ X(Temp)						\
 			LogOperations(InLogFormatOperations),
 			OperationCount(InOperationCount),
 			ArgumentCount(InArgumentCount),
+			LogSize(InLogSize),
+			StringArgumentCount(InStringArgumentCount),
 			ThreadID(std::this_thread::get_id()),
 			Time(NX_Clock::now())
 		{
@@ -717,6 +760,8 @@ X(Temp)						\
 
 		std::size_t OperationCount = 0;
 		std::size_t ArgumentCount = 0;
+		std::size_t LogSize = 0;
+		std::size_t StringArgumentCount = 0;
 
 		NX_TimePoint Time = NX_Clock::now();
 	};
@@ -744,6 +789,7 @@ X(Temp)						\
 
 		bool IsEmpty() const;
 		bool IsFull() const;
+		bool HasCapacityFor(std::size_t InLength) const;
 
 		bool AppendToArena_Literal(const char* InData, std::size_t InLength);
 
@@ -759,7 +805,7 @@ X(Temp)						\
 		{
 			using Type = std::remove_cvref_t<Number>;
 
-			constexpr std::size_t reqSize = GetToCharsBufferSize<Type>();
+			constexpr std::size_t reqSize = GetMaxFormattedSize<Type>();
 			static_assert(reqSize <= m_formatBufferSize);
 
 			auto* fBuffer = m_numericFormatBuffer.data();
@@ -798,8 +844,6 @@ X(Temp)						\
 		}
 
 	private:
-
-		bool HasCapacityFor(std::size_t InLength) const;
 
 		// Private Members
 
@@ -1398,7 +1442,7 @@ X(Temp)						\
 
 		// Format Log Data -----------------------------------------------------------------------------------------------------------
 
-		bool FormatLogDataToArena()
+		int8_t FormatLogDataToArena()
 		{
 			for (uint64_t seq = m_trackedData.Sequence_Begin; seq <= m_trackedData.Sequence_End; ++seq)
 			{
@@ -1407,7 +1451,7 @@ X(Temp)						\
 				if (slot == nullptr)
 				{
 					assert(false && "Log Slot is null");
-					continue;
+					return -1;
 				}
 
 				LogData* data = slot->Data;
@@ -1415,7 +1459,33 @@ X(Temp)						\
 				if (data == nullptr)
 				{
 					assert(false && "Log Data is null");
-					continue;
+					return -1;
+				}
+
+				std::size_t stringCount = 0;
+				std::size_t inspectedStringArguments = 0;
+
+				if (data->StringArgumentCount != 0)
+				{
+					for (const LogArgument& arg : data->LogArguments)
+					{
+						if (inspectedStringArguments >= data->StringArgumentCount)
+						{
+							break;
+						}
+
+						if (arg.ArgType == LogArgumentType::StringLiteral)
+						{
+							const char* string = arg.ArgValue.StringLiteral;
+
+							if (string != nullptr)
+							{
+								stringCount += std::char_traits<char>::length(string);
+							}
+
+							++inspectedStringArguments;
+						}
+					}
 				}
 
 				const char* categoryString = ToString(data->Category).data();
@@ -1425,18 +1495,36 @@ X(Temp)						\
 				const std::size_t levelSize = std::char_traits<char>::length(levelString);
 
 				const double logTimestamp = GetDurationMilliseconds(data->Time);
-				constexpr std::size_t timeStampSize = GetToCharsBufferSize<double>();
+				constexpr std::size_t timeStampSize = GetMaxFormattedSize<double>();
 
-				m_logArena.AppendToArena_Literal("[ ", 2);
-				m_logArena.AppendToArena_Literal(categoryString, categorySize);
-				m_logArena.AppendToArena_Literal(" ] [ ", 5);
-				m_logArena.AppendToArena_Literal(levelString, levelSize);
-				m_logArena.AppendToArena_Literal(" ] [ ", 5);
-				m_logArena.AppendToArena_Numeric(logTimestamp);
+				// "[ " + " ] [ " + " ] [ " + "] "
+				// Need not count line ending, LogSize already accounts for that
+				constexpr std::size_t headerLiteralSize = 14;
 
-				m_logArena.AppendToArena_Literal(" ", 5);
-				ExecuteLogFormatOperations(data->LogFormatString, data->LogArguments.data(), data->LogOperations, data->OperationCount);
+				const std::size_t requiredSize =
+					headerLiteralSize +
+					categorySize + levelSize +
+					timeStampSize +
+					data->LogSize +
+					stringCount;
+
+				if (!m_logArena.HasCapacityFor(requiredSize))
+				{
+					return 1;
+				}
+
+				if(!m_logArena.AppendToArena_Literal("[ ", 2)) return -1;
+				if(!m_logArena.AppendToArena_Literal(categoryString, categorySize)) return -1;
+				if(!m_logArena.AppendToArena_Literal(" ] [ ", 5)) return -1;
+				if(!m_logArena.AppendToArena_Literal(levelString, levelSize)) return -1;
+				if(!m_logArena.AppendToArena_Literal(" ] [ ", 5)) return -1;
+				if(!m_logArena.AppendToArena_Numeric(logTimestamp)) return -1;
+				if(!m_logArena.AppendToArena_Literal("] ", 2)) return -1;
+				if(!ExecuteLogFormatOperations(data->LogFormatString, data->LogArguments.data(), data->LogOperations, data->OperationCount)) return -1;
+				if(!m_logArena.AppendToArena_Literal("\n", 1)) return -1;
 			}
+
+			return 0;
 		}
 
 
