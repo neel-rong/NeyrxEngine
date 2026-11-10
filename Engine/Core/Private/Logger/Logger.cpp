@@ -111,12 +111,20 @@ void Logger::TryAndPublishLogData()
 	{
 		PublishCursor_End = trackedData.Sequence_End;
 
-		m_orderedLogWindow.PublishLogData(PublishCursor_End, [this](const LogData& Data)
+		LogPublishState publishState = m_orderedLogWindow.PublishLogData(PublishCursor_End,
+			[this](LogArena& InLogArena)
 			{
 				for (auto& sink : m_sinks)
 				{
-					sink->Publish(Data);
+					LogPublishState state = sink->Publish(m_orderedLogWindow.GetLogArena());
+
+					if (state != LogPublishState::SUCCESS)
+					{
+						return state;
+					}
 				}
+
+				return LogPublishState::SUCCESS;
 			});
 
 		break;
@@ -135,12 +143,20 @@ void Logger::TryAndPublishLogData()
 			PublishCursor_End = missing - 1;
 		}
 
-		m_orderedLogWindow.PublishLogData(PublishCursor_End, [this](LogData& Data)
+		LogPublishState publishState = m_orderedLogWindow.PublishLogData(PublishCursor_End,
+			[this](LogArena& InLogArena)
 			{
 				for (auto& sink : m_sinks)
 				{
-					sink->Publish(Data);
+					LogPublishState state = sink->Publish(m_orderedLogWindow.GetLogArena());
+
+					if (state != LogPublishState::SUCCESS)
+					{
+						return state;
+					}
 				}
+
+				return LogPublishState::SUCCESS;
 			});
 
 

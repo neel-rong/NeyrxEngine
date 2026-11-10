@@ -15,9 +15,11 @@ public:
 
 	virtual ~TestSink() = default;
 
-    inline virtual void Publish(const Neyrx::Logger::LogData& InLogData) override
+    inline virtual LogPublishState Publish(LogArena& Arena) override
     {
 		++m_messageCount;
+
+		return LogPublishState::SUCCESS;
 	}
 
 	uint64_t GetMessageCount() const
@@ -63,16 +65,19 @@ void Worker()
 	NX_Logger.RegisterLogQueue();
 	while (!StopProducer)
 	{
-		for (int i = 0; i < 4096; ++i)
+		for (int i = 0; i < 1024; ++i)
 		{
 			InputLog(g_msgCount.count);
 		}
+
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
 }
 
 int main()
 {
+	Neyrx::Time::Initialize();
+
 	std::cout << "Starting Logger Test...\n";
 
 	NX_Logger.Initialize();
@@ -86,12 +91,12 @@ int main()
 	std::thread thread4(Worker);
 	std::thread thread5(Worker);
 	std::thread thread6(Worker);
-	std::thread thread7(Worker);
-	std::thread thread8(Worker);
+	/*std::thread thread7(Worker);
+	std::thread thread8(Worker);*/
 
 	std::thread thread20(LogWorker);
 
-	std::this_thread::sleep_for(std::chrono::seconds(300));
+	std::this_thread::sleep_for(std::chrono::seconds(15));
 
 	StopProducer = true;
 
@@ -101,8 +106,8 @@ int main()
 	thread4.join();
 	thread5.join();
 	thread6.join();
-	thread7.join();
-	thread8.join();
+	/*thread7.join();
+	thread8.join();*/
 
 	std::cout << "__PRODUCER THREADS JOINED__" << std::endl;
 

@@ -22,7 +22,7 @@ void LogArena::Initialize()
 
 void LogArena::Reset()
 {
-	m_arenaBuffer.Reset();
+	m_arenaBuffer->Reset();
 }
 
 
@@ -30,7 +30,7 @@ void LogArena::Reset()
 
 std::size_t LogArena::GetSize() const
 {
-	return m_arenaBuffer.GetSize();
+	return m_arenaBuffer->GetSize();
 }
 
 
@@ -38,7 +38,7 @@ std::size_t LogArena::GetSize() const
 
 std::size_t LogArena::GetArenaStart() const
 {
-	return m_arenaBuffer.FrontIndex();
+	return m_arenaBuffer->FrontIndex();
 }
 
 
@@ -46,7 +46,7 @@ std::size_t LogArena::GetArenaStart() const
 
 std::size_t LogArena::GetArenaEnd() const
 {
-	return m_arenaBuffer.BackIndex();
+	return m_arenaBuffer->BackIndex();
 }
 
 
@@ -54,7 +54,7 @@ std::size_t LogArena::GetArenaEnd() const
 
 char* LogArena::GetHeadData()
 {
-	return &m_arenaBuffer.Front();
+	return &m_arenaBuffer->Front();
 }
 
 
@@ -62,7 +62,7 @@ char* LogArena::GetHeadData()
 
 bool LogArena::IsEmpty() const
 {
-	return m_arenaBuffer.IsEmpty();
+	return m_arenaBuffer->IsEmpty();
 }
 
 
@@ -70,15 +70,7 @@ bool LogArena::IsEmpty() const
 
 bool LogArena::IsFull() const
 {
-	return m_arenaBuffer.IsFull();
-}
-
-
-
-
-bool LogArena::AppendToArena_Literal(const char* InData, std::size_t InLength)
-{
-	return m_arenaBuffer.ReserveAndEnqueue(const_cast<char*>(InData), InLength);
+	return m_arenaBuffer->IsFull();
 }
 
 
@@ -86,7 +78,23 @@ bool LogArena::AppendToArena_Literal(const char* InData, std::size_t InLength)
 
 bool LogArena::HasCapacityFor(std::size_t InLength) const
 {
-	return m_arenaBuffer.HasCapacityFor(InLength);
+	return m_arenaBuffer->HasCapacityFor(InLength);
+}
+
+
+
+
+void LogArena::Clear()
+{
+	m_arenaBuffer->Clear();
+}
+
+
+
+
+bool LogArena::AppendToArena_Literal(const char* InData, std::size_t InLength)
+{
+	return m_arenaBuffer->ReserveAndEnqueue(const_cast<char*>(InData), InLength);
 }
 
 
@@ -228,7 +236,7 @@ OrderedLogSlot* OrderedLogBuffer::GetReservedSlot(const uint64_t InSequenceNumbe
 
 	if (!bpos.IsValid()) return nullptr;
 
-	OrderedLogSlot* slot = &OrderedLogBuffers[bpos.ChunkIndex][bpos.Offset];
+	OrderedLogSlot* slot = &(*OrderedLogBuffers)[bpos.ChunkIndex][bpos.Offset];
 
 	return slot;
 }
@@ -246,7 +254,7 @@ const OrderedLogSlot* OrderedLogBuffer::GetReservedSlot(const uint64_t InSequenc
 		return nullptr;
 	}
 
-	const OrderedLogSlot* slot = &OrderedLogBuffers[bpos.ChunkIndex][bpos.Offset];
+	const OrderedLogSlot* slot = &(*OrderedLogBuffers)[bpos.ChunkIndex][bpos.Offset];
 
 	return slot;
 }
@@ -289,7 +297,7 @@ LogReserveState OrderedLogBuffer::DereserveSequences(uint64_t EndSequenceNumber)
 
 	for (uint64_t seq = Start;; ++seq)
 	{
-		OrderedLogSlot& slot = OrderedLogBuffers[bufPos.ChunkIndex][bufPos.Offset];
+		OrderedLogSlot& slot = (*OrderedLogBuffers)[bufPos.ChunkIndex][bufPos.Offset];
 
 		assert(slot.SequenceNumber == seq && "Unexpected Sequence Number in Reserved Slot");
 
@@ -368,7 +376,7 @@ LogReserveState OrderedLogBuffer::ReserveSequences(const uint64_t InStartSequenc
 			m_bufferWriteCursor.Offset = 0;
 		}
 
-		OrderedLogBuffers[m_bufferWriteCursor.ChunkIndex][m_bufferWriteCursor.Offset].SequenceNumber = sequence;
+		(*OrderedLogBuffers)[m_bufferWriteCursor.ChunkIndex][m_bufferWriteCursor.Offset].SequenceNumber = sequence;
 		++m_bufferWriteCursor.Offset;
 		++m_bufferSize[m_bufferWriteCursor.ChunkIndex];
 	}
@@ -524,6 +532,14 @@ const TrackedLogData& OrderedLogWindow::GetTrackedLogData() const
 
 
 
+LogArena& OrderedLogWindow::GetLogArena()
+{
+	return m_logArena;
+}
+
+
+
+
 LogReserveState OrderedLogWindow::ReserveLogSlotsForTracking()
 {
 	LogReserveState state = m_orderedLogBuffer.GetReserveState();
@@ -547,4 +563,177 @@ LogReserveState OrderedLogWindow::ReserveLogSlotsForTracking()
 	}
 
 	return m_orderedLogBuffer.ReserveSequences(startRes);
+}
+
+
+
+//
+//LogFormatState OrderedLogWindow::FormatLogDataToArena(uint64_t EndSequenceNumber, std::size_t& OutMissingSequenceCount)
+//{
+//	uint64_t expected = m_lastPublishSequence == InvalidSequenceNumber
+//		? 0
+//		: m_lastPublishSequence + 1;
+//
+//	m_formatData.Sequence_Begin = expected; // Set Being before the loop
+//
+//	LogFormatState formatState = LogFormatState::SUCCESS;
+//
+//	while (expected <= EndSequenceNumber)
+//	{
+//		OrderedLogSlot* slot = m_orderedLogBuffer.GetReservedSlot(expected);
+//
+//		if (slot == nullptr)
+//		{
+//			assert(false && "Log Slot is null");
+//			return LogFormatState::INVALID_INTERNAL_STATE;
+//		}
+//
+//		LogData* data = slot->Data;
+//
+//		if (data == nullptr)
+//		{
+//			++OutMissingSequenceCount;
+//			++expected;
+//			continue;
+//		}
+//
+//		std::size_t stringCount = 0;
+//		std::size_t inspectedStringArguments = 0;
+//
+//		if (data->StringArgumentCount != 0)
+//		{
+//			for (const LogArgument& arg : data->LogArguments)
+//			{
+//				if (inspectedStringArguments >= data->StringArgumentCount)
+//				{
+//					break;
+//				}
+//
+//				if (arg.ArgType == LogArgumentType::StringLiteral)
+//				{
+//					const char* string = arg.ArgValue.StringLiteral;
+//
+//					if (string != nullptr)
+//					{
+//						stringCount += std::char_traits<char>::length(string);
+//					}
+//
+//					++inspectedStringArguments;
+//				}
+//			}
+//		}
+//
+//		std::string_view categoryStringView = ToString(data->Category);
+//		const std::size_t categorySize = categoryStringView.length();
+//
+//		std::string_view levelStringView = ToString(data->Level);
+//		const std::size_t levelSize = levelStringView.length();
+//
+//		const double logTimestamp = GetDurationMilliseconds(data->Time);
+//		constexpr std::size_t timeStampSize = GetMaxFormattedSize<double>();
+//
+//		 "[ " + " ] [ " + " ] [ " + "] "
+//		 Need not count line ending, LogSize already accounts for that
+//		constexpr std::size_t headerLiteralSize = 14;
+//
+//		const std::size_t requiredSize =
+//			headerLiteralSize +
+//			categorySize + levelSize +
+//			timeStampSize +
+//			data->LogSize +
+//			stringCount;
+//
+//		if (!m_logArena.HasCapacityFor(requiredSize))
+//		{
+//			formatState = LogFormatState::PARTIAL_SUCESS_CAPACITY;
+//			break;
+//		}
+//
+//		if (!m_logArena.AppendToArena_Literal("[ ", 2)) return LogFormatState::INVALID_INTERNAL_STATE;
+//		if (!m_logArena.AppendToArena_Literal(categoryStringView.data(), categorySize)) return LogFormatState::INVALID_INTERNAL_STATE;
+//		if (!m_logArena.AppendToArena_Literal(" ] [ ", 5)) return LogFormatState::INVALID_INTERNAL_STATE;
+//		if (!m_logArena.AppendToArena_Literal(levelStringView.data(), levelSize)) return LogFormatState::INVALID_INTERNAL_STATE;
+//		if (!m_logArena.AppendToArena_Literal(" ] [ ", 5)) return LogFormatState::INVALID_INTERNAL_STATE;
+//		if (!m_logArena.AppendToArena_Numeric(logTimestamp)) return LogFormatState::INVALID_INTERNAL_STATE;
+//		if (!m_logArena.AppendToArena_Literal("] ", 2)) return LogFormatState::INVALID_INTERNAL_STATE;
+//		if (!ExecuteLogFormatOperations(data->LogFormatString, data->LogArguments.data(), data->LogOperations, data->OperationCount)) return LogFormatState::INVALID_INTERNAL_STATE;
+//		if (!m_logArena.AppendToArena_Literal("\n", 1)) return LogFormatState::INVALID_INTERNAL_STATE;
+//
+//		m_formatData.Sequence_End = expected;
+//		m_formatData.Sequence_MaxFormatted = expected;
+//		++expected;
+//
+//	}
+//
+//	return formatState;
+//}
+
+
+
+
+LogFormatState OrderedLogWindow::FormatLogDataToArena(LogData* Data)
+{
+	// Inspect String Arguments for Capacity querry
+	std::size_t stringCount = 0;
+	std::size_t inspectedStringArguments = 0;
+
+	if (Data->StringArgumentCount != 0)
+	{
+		for (const LogArgument& arg : Data->LogArguments)
+		{
+			if (inspectedStringArguments >= Data->StringArgumentCount)
+			{
+				break;
+			}
+
+			if (arg.ArgType == LogArgumentType::StringLiteral)
+			{
+				const char* string = arg.ArgValue.StringLiteral;
+
+				if (string != nullptr)
+				{
+					stringCount += std::char_traits<char>::length(string);
+				}
+
+				++inspectedStringArguments;
+			}
+		}
+	}
+
+	std::string_view categoryStringView = ToString(Data->Category);
+	const std::size_t categorySize = categoryStringView.length();
+
+	std::string_view levelStringView = ToString(Data->Level);
+	const std::size_t levelSize = levelStringView.length();
+
+	const double logTimestamp = GetDurationMilliseconds(Data->Time);
+	constexpr std::size_t timeStampSize = GetMaxFormattedSize<double>();
+
+	// "[ " + " ] [ " + " ] [ " + "] "
+	// Need not count line ending, LogSize already accounts for that
+	constexpr std::size_t headerLiteralSize = 14;
+
+	const std::size_t requiredSize =
+		headerLiteralSize +
+		categorySize + levelSize +
+		timeStampSize +
+		Data->LogSize +
+		stringCount;
+
+	if (!m_logArena.HasCapacityFor(requiredSize))
+	{
+		return LogFormatState::FAILURE_CAPACITY;
+	}
+
+	if (!m_logArena.AppendToArena_Literal("[ ", 2)) return LogFormatState::INVALID_INTERNAL_STATE;
+	if (!m_logArena.AppendToArena_Literal(categoryStringView.data(), categorySize)) return LogFormatState::INVALID_INTERNAL_STATE;
+	if (!m_logArena.AppendToArena_Literal(" ] [ ", 5)) return LogFormatState::INVALID_INTERNAL_STATE;
+	if (!m_logArena.AppendToArena_Literal(levelStringView.data(), levelSize)) return LogFormatState::INVALID_INTERNAL_STATE;
+	if (!m_logArena.AppendToArena_Literal(" ] [ ", 5)) return LogFormatState::INVALID_INTERNAL_STATE;
+	if (!m_logArena.AppendToArena_Numeric(logTimestamp)) return LogFormatState::INVALID_INTERNAL_STATE;
+	if (!m_logArena.AppendToArena_Literal("] ", 2)) return LogFormatState::INVALID_INTERNAL_STATE;
+	if (!ExecuteLogFormatOperations(Data->LogFormatString, Data->LogArguments.data(), Data->LogOperations, Data->OperationCount)) return LogFormatState::INVALID_INTERNAL_STATE;
+	if (!m_logArena.AppendToArena_Literal("\n", 1)) return LogFormatState::INVALID_INTERNAL_STATE;
+
+	return LogFormatState::SUCCESS;
 }

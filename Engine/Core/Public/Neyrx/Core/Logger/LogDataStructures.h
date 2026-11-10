@@ -12,6 +12,7 @@
 #include <tuple>
 #include <utility>
 #include <concepts>
+#include <functional>
 #include <limits>
 
 #include "Neyrx/Core/Container/Queue.h"
@@ -27,13 +28,13 @@
 inline constexpr uint64_t InvalidSequenceNumber = std::numeric_limits<uint64_t>::max();
 inline constexpr uint64_t Invalidindex = std::numeric_limits<uint64_t>::max();
 
-inline constexpr std::size_t NumberOfThreads = 8;
+inline constexpr std::size_t NumberOfThreads = 6;
 inline constexpr std::size_t ThreadQueueSize = 16384;
 
 inline constexpr std::size_t MaxLogArguments = 8;
 
 inline constexpr std::size_t g_OrderedLogCapacity = ThreadQueueSize * NumberOfThreads;
-inline constexpr std::size_t g_estimatedLogStringSize = 256;
+inline constexpr std::size_t g_estimatedLogStringSize = 1024;
 
 
 using namespace Neyrx::Time;
@@ -86,6 +87,8 @@ namespace Neyrx::Logger
 
 	enum class LogPublishState : uint8_t
 	{
+		UNINITIALIZED,
+
 		SUCCESS,
 		SUCCESS_WITH_MISSING,
 
@@ -93,6 +96,22 @@ namespace Neyrx::Logger
 		FAILURE_UNINITIALIZED,
 		FAILURE_INVALID_SEQUENCE,
 
+		INVALID_INTERNAL_STATE
+	};
+
+
+
+
+
+	// ==========================================================================================================
+	// Enum Format State
+	// ==========================================================================================================
+
+	enum class LogFormatState : uint8_t
+	{
+		SUCCESS,
+
+		FAILURE_CAPACITY,
 		INVALID_INTERNAL_STATE
 	};
 
@@ -144,9 +163,9 @@ namespace Neyrx::Logger
 	// ==========================================================================================================
 
 #define NEYRX_LOG_LEVELS(X) \
-X(Info)					\
-X(Warning)				\
-X(Error)				\
+X(Info)						\
+X(Warning)					\
+X(Error)					\
 X(Fatal)
 
 	enum class LogLevel
@@ -176,7 +195,7 @@ X(Fatal)
 	// ==========================================================================================================
 
 #define NEYRX_LOG_CATEGORY(X)	\
-X(Temp)						\
+X(Temp)							\
 
 
 	enum class LogCategory
@@ -588,7 +607,12 @@ X(Temp)						\
 			metadata.LogSize += Format.size() - offset;
 		}
 
-		++metadata.LogSize; // Add 1 for line ending
+		++metadata.LogSize; // Increment for line ending
+
+		if (metadata.LogSize > g_estimatedLogStringSize)
+		{
+			throw "Log format exceeds maximum estimated log string size";
+		}
 
 		return metadata;
 	}
@@ -791,6 +815,8 @@ X(Temp)						\
 		bool IsFull() const;
 		bool HasCapacityFor(std::size_t InLength) const;
 
+		void Clear();
+
 		bool AppendToArena_Literal(const char* InData, std::size_t InLength);
 
 		template<typename Number>
@@ -849,7 +875,9 @@ X(Temp)						\
 
 		static constexpr std::size_t m_formatBufferSize = 128;
 
-		RingBuffer<char, g_OrderedLogCapacity* g_estimatedLogStringSize> m_arenaBuffer{ };
+		using Buffer = RingBuffer<char, g_OrderedLogCapacity* g_estimatedLogStringSize>;
+
+		std::unique_ptr<Buffer> m_arenaBuffer = std::make_unique<Buffer>();
 		std::array<char, m_formatBufferSize> m_numericFormatBuffer{ };
 	};
 
@@ -976,6 +1004,17 @@ X(Temp)						\
 
 
 	// ==========================================================================================================
+	// Sliding Bitmap
+	// ==========================================================================================================
+
+	class SlidingBitmap
+	{
+
+	};
+
+
+
+	// ==========================================================================================================
 	// Ordered Log Buffer
 	// ==========================================================================================================
 
@@ -1073,7 +1112,9 @@ X(Temp)						\
 
 		static constexpr std::size_t m_orderedLogBufferChunkCount = 3;
 
-		std::array<std::array <OrderedLogSlot, Capacity>, m_orderedLogBufferChunkCount> OrderedLogBuffers{ };
+		using Buffer = std::array<std::array <OrderedLogSlot, Capacity>, m_orderedLogBufferChunkCount>;
+
+		std::unique_ptr<Buffer> OrderedLogBuffers = std::make_unique<Buffer>();
 
 		BufferPosition m_bufferIndexStart{ 0 ,0 };								// Physical position of the oldest live reserved slot.
 		BufferPosition m_bufferWriteCursor{ 0, 0 };								// Physical position of the next slot to reserve.
@@ -1117,8 +1158,12 @@ X(Temp)						\
 
 		const OrderedLogSlot* GetTrackedSlot(uint64_t SequenceNumber) const;
 		const TrackedLogData& GetTrackedLogData() const;
+		LogArena& GetLogArena();
 
 		LogReserveState ReserveLogSlotsForTracking();
+
+		LogFormatState FormatLogDataToArena(uint64_t EndSequenceNumber, std::size_t& OutMissingSequenceCount);
+		LogFormatState FormatLogDataToArena(LogData* Data);
 
 
 		// ---------------------------------------------------------------------------------------------------------------------------
@@ -1241,9 +1286,9 @@ X(Temp)						\
 
 						if (!m_logArena.AppendToArena_Numeric(pointer, 16))
 							return false;
-
-						break;
 					}
+
+					break;
 				}
 
 				case LogFormatOpType::EscapedPercent :
@@ -1440,97 +1485,12 @@ X(Temp)						\
 
 
 
-		// Format Log Data -----------------------------------------------------------------------------------------------------------
-
-		int8_t FormatLogDataToArena()
-		{
-			for (uint64_t seq = m_trackedData.Sequence_Begin; seq <= m_trackedData.Sequence_End; ++seq)
-			{
-				OrderedLogSlot* slot = m_orderedLogBuffer.GetReservedSlot(seq);
-
-				if (slot == nullptr)
-				{
-					assert(false && "Log Slot is null");
-					return -1;
-				}
-
-				LogData* data = slot->Data;
-
-				if (data == nullptr)
-				{
-					assert(false && "Log Data is null");
-					return -1;
-				}
-
-				std::size_t stringCount = 0;
-				std::size_t inspectedStringArguments = 0;
-
-				if (data->StringArgumentCount != 0)
-				{
-					for (const LogArgument& arg : data->LogArguments)
-					{
-						if (inspectedStringArguments >= data->StringArgumentCount)
-						{
-							break;
-						}
-
-						if (arg.ArgType == LogArgumentType::StringLiteral)
-						{
-							const char* string = arg.ArgValue.StringLiteral;
-
-							if (string != nullptr)
-							{
-								stringCount += std::char_traits<char>::length(string);
-							}
-
-							++inspectedStringArguments;
-						}
-					}
-				}
-
-				const char* categoryString = ToString(data->Category).data();
-				const std::size_t categorySize = std::char_traits<char>::length(categoryString);
-
-				const char* levelString = ToString(data->Level).data();
-				const std::size_t levelSize = std::char_traits<char>::length(levelString);
-
-				const double logTimestamp = GetDurationMilliseconds(data->Time);
-				constexpr std::size_t timeStampSize = GetMaxFormattedSize<double>();
-
-				// "[ " + " ] [ " + " ] [ " + "] "
-				// Need not count line ending, LogSize already accounts for that
-				constexpr std::size_t headerLiteralSize = 14;
-
-				const std::size_t requiredSize =
-					headerLiteralSize +
-					categorySize + levelSize +
-					timeStampSize +
-					data->LogSize +
-					stringCount;
-
-				if (!m_logArena.HasCapacityFor(requiredSize))
-				{
-					return 1;
-				}
-
-				if(!m_logArena.AppendToArena_Literal("[ ", 2)) return -1;
-				if(!m_logArena.AppendToArena_Literal(categoryString, categorySize)) return -1;
-				if(!m_logArena.AppendToArena_Literal(" ] [ ", 5)) return -1;
-				if(!m_logArena.AppendToArena_Literal(levelString, levelSize)) return -1;
-				if(!m_logArena.AppendToArena_Literal(" ] [ ", 5)) return -1;
-				if(!m_logArena.AppendToArena_Numeric(logTimestamp)) return -1;
-				if(!m_logArena.AppendToArena_Literal("] ", 2)) return -1;
-				if(!ExecuteLogFormatOperations(data->LogFormatString, data->LogArguments.data(), data->LogOperations, data->OperationCount)) return -1;
-				if(!m_logArena.AppendToArena_Literal("\n", 1)) return -1;
-			}
-
-			return 0;
-		}
-
-
 
 		// Publish Log Data ----------------------------------------------------------------------------------------------------------
 		template <typename Publisher>
+		requires std::invocable<Publisher, LogArena&> &&
+						std::same_as<std::invoke_result_t<Publisher, LogArena&>,
+						LogPublishState>
 		LogPublishState PublishLogData(uint64_t EndSequenceNumber, Publisher&& PublishFunction)
 		{
 			if (m_trackedData.GetTrackerState() == LogTrackerState::UNINITIALIZED) return LogPublishState::FAILURE_UNINITIALIZED;
@@ -1543,6 +1503,7 @@ X(Temp)						\
 
 			LogPublishState publishState = LogPublishState::SUCCESS;
 
+
 			uint64_t expected = m_lastPublishSequence == InvalidSequenceNumber
 				? 0
 				: m_lastPublishSequence + 1;
@@ -1553,54 +1514,91 @@ X(Temp)						\
 
 				if (slot == nullptr)
 				{
-					std::cout << "Null Slot found in OrderedLogBuffer" << std::endl;
+					__debugbreak();
 					assert(false);
-					++expected;
-					continue;
+					return LogPublishState::INVALID_INTERNAL_STATE;
 				}
 
 				LogData* data = slot->Data;
 
 				if (data == nullptr)
 				{
-					//std::cout << "Null Data found in OrderedLogBuffer" << std::endl;
-					/*MissingDataTemplate.Sequence = expected;
-					PublishFunction(MissingDataTemplate);*/
 					++m_skippedLogCount;
-				}
-				else
-				{
-					PublishFunction(*data);
+					++expected;
+					continue;
 				}
 
-				m_lastPublishSequence = expected;
+				LogFormatState formatState = FormatLogDataToArena(data);
+
+				if (formatState == LogFormatState::INVALID_INTERNAL_STATE)
+				{
+					__debugbreak();
+					return LogPublishState::INVALID_INTERNAL_STATE;
+				}
+
+				// If Arena is at capacity, publish Formatted Logs and continue processing the pending Tracked Logs
+				if (formatState == LogFormatState::FAILURE_CAPACITY)
+				{
+					if (m_logArena.IsEmpty())
+					{
+						return LogPublishState::INVALID_INTERNAL_STATE;
+					}
+
+					// PublishFunction only modifies m_lastPublishSequence if any log is actually published,
+					LogPublishState OutPublishState = PublishFunction(m_logArena);
+
+					if (OutPublishState != LogPublishState::SUCCESS)
+					{
+						assert(false);
+						return LogPublishState::INVALID_INTERNAL_STATE;
+					}
+					else
+					{
+						m_logArena.Clear();
+						m_lastPublishSequence = expected - 1;
+						continue;
+					}
+				}
+
 				++expected;
 			}
 
+			// Publish Missing or Stale Logs to Sinks and Dequeue the ThreadContext Queues
+			// if m_skippedLogCount > 0, then search for missing or stale logs and publish
+			// else, simply dequeue
+			//
+			// Once the a context dequeue process enters a condition statment
+			// It enters a loop and cannot exit till loop condition is false
+			// Because of this, it needs a guard against m_skippedLogCount underflow
+
+
 			uint64_t begin = m_trackedData.Sequence_Begin;
 
-			// Publish to Sinks and Dequeue the ThreadContext Queues
 			for (auto& context : m_loggerRegistryPointer->m_threadContexts)
 			{
 				auto& logBuffer = context.ThreadQueue;
 
 				if (m_skippedLogCount > 0)
 				{
-					while (!logBuffer.IsEmpty() && logBuffer.PeekLogical(0).Sequence <= EndSequenceNumber)
+					while (!logBuffer.IsEmpty() &&
+						logBuffer.PeekLogical(0).Sequence <= EndSequenceNumber)
 					{
-						uint64_t seq = logBuffer.PeekLogical(0).Sequence;
-						if (seq < begin)
+						if (m_skippedLogCount > 0)	// Underflow gaurd
 						{
-							PublishFunction(logBuffer.PeekLogical(0));
-							--m_skippedLogCount;
-							++m_invertedLogCount;
-						}
-						else if (std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), seq) !=
-							m_trackedData.Sequence_Missing.end())
-						{
-							PublishFunction(logBuffer.PeekLogical(0));
-							--m_skippedLogCount;
-							++m_invertedLogCount;
+							uint64_t seq = logBuffer.PeekLogical(0).Sequence;
+							if (seq < begin)
+							{
+								FormatLogDataToArena(&logBuffer.PeekLogical(0));
+								--m_skippedLogCount;
+								++m_invertedLogCount;
+							}
+							else if (std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), seq) !=
+								m_trackedData.Sequence_Missing.end())
+							{
+								FormatLogDataToArena(&logBuffer.PeekLogical(0));
+								--m_skippedLogCount;
+								++m_invertedLogCount;
+							}
 						}
 
 						logBuffer.Dequeue();
@@ -1615,6 +1613,23 @@ X(Temp)						\
 					}
 				}
 			}
+
+			// Publish Stale data from the Log Arena, if any
+			if (!m_logArena.IsEmpty())
+			{
+				// PublishFunction only modifies m_lastPublishSequence if any log is actually published,
+				LogPublishState OutPublishState = PublishFunction(m_logArena);
+
+				if (OutPublishState != LogPublishState::SUCCESS)
+				{
+					assert(false);
+					return LogPublishState::INVALID_INTERNAL_STATE;
+				}
+
+				m_logArena.Clear();
+			}
+
+			m_lastPublishSequence = m_trackedData.Sequence_End;
 
 
 			// Dereserve the m_orderedLogBuffer
@@ -1671,6 +1686,7 @@ X(Temp)						\
 		// =====================================
 
 		TrackedLogData m_trackedData;
+
 
 		OrderedLogBuffer m_orderedLogBuffer;
 		LogArena m_logArena;

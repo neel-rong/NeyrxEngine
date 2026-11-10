@@ -13,7 +13,7 @@ namespace Neyrx::Logger
 
 		virtual ~ILoggerSink() = default;
 
-		virtual void Publish(const LogData& InLogData) = 0;
+		virtual LogPublishState Publish(LogArena& Arena) = 0;
 	};
 
 
@@ -29,8 +29,9 @@ namespace Neyrx::Logger
 
 		virtual ~IConsoleSink() = default;
 
-		inline virtual void Publish(const LogData& InLogData) override
+		inline virtual LogPublishState Publish(LogArena& Arena) override
 		{
+			return LogPublishState::SUCCESS;
 		}
 	};
 }

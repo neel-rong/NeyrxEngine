@@ -313,7 +313,7 @@ namespace Neyrx
 		{
 			std::size_t freeSpace = (Capacity - 1) - GetSize();
 
-			return freeSpace > Count;
+			return freeSpace >= Count;
 		}
 
 		// Increments the Head and frees the index at the Front of the Queue
@@ -352,6 +352,12 @@ namespace Neyrx
 		std::size_t GetSize() const
 		{
 			return (m_tail + Capacity - m_head) % Capacity;
+		}
+
+		void Clear()
+		{
+			m_head = 0;
+			m_tail = 0;
 		}
 
 	private:
