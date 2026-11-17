@@ -6,21 +6,21 @@ add_library(
     NeyrxCore
     STATIC
 
-    "Core/Private/Logger/Logger.cpp"
-    "Core/Private/Logger/LogDataStructures.cpp"
-    "Core/Private/Time/NX_Time.cpp"
+    # Logger
+    Core/Private/Logger/Logger.cpp
+    Core/Private/Logger/LogDataStructures.cpp
+
+    # Time
+    Core/Private/Time/NX_Time.cpp
+
+    # Public Headers
+    Core/Public/Neyrx/Core/Time/NX_HighResTimer.h
 )
 
 target_include_directories(
     NeyrxCore
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/Public
-)
-
-target_include_directories(
-    NeyrxCore
-    PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/Time/Public
 )
 
 target_compile_definitions(
@@ -32,3 +32,11 @@ target_compile_definitions(
         $<$<CONFIG:Development>:NEYRX_ENABLE_LOGGING>
         $<$<CONFIG:Development>:NEYRX_ENABLE_DEVELOPMENT>
 )
+
+if(MSVC)
+    target_compile_options(
+        NeyrxCore
+        PUBLIC
+            /Zc:preprocessor
+    )
+endif()

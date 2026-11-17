@@ -1,3 +1,4 @@
+#include <immintrin.h>
 #include "Neyrx/Core/Logger/Logger.h"
 
 
@@ -82,123 +83,48 @@ LogThreadContext* Logger::GetLogThreadContext()
 
 void Logger::TryAndPublishLogData()
 {
-	// Call reserve Slot at the start of every functionCall
-	m_orderedLogWindow.ReserveLogSlotsForTracking();
-
-	// Get a reference to the TrackedLogData
-	auto& trackedData = m_orderedLogWindow.GetTrackedLogData();
-
-	// Always set PublishCursor_Start to tracked begin. PublishCursor_End is resolved based on missing index.
-	PublishCursor_Start = trackedData.Sequence_Begin;
-
-	if (trackedData.GetTrackerState() == LogTrackerState::UNINITIALIZED)
-	{
-		PublishCursor_Start = 0;
-		PublishCursor_End = 0;
-	}
-	else if (trackedData.GetTrackerState() == LogTrackerState::UNTRACKED)
-	{
-		PublishCursor_Start = trackedData.Sequence_MaxTracked + 1;
-		PublishCursor_End = PublishCursor_Start;
-	}
-
-	const LogTrackerState& trackerState = m_orderedLogWindow.TrackLogData();
-
-
-	switch (trackerState)
-	{
-	case LogTrackerState::TRACKED_ALL :
-	{
-		PublishCursor_End = trackedData.Sequence_End;
-
-		LogPublishState publishState = m_orderedLogWindow.PublishLogData(PublishCursor_End,
-			[this](LogArena& InLogArena)
-			{
-				for (auto& sink : m_sinks)
-				{
-					LogPublishState state = sink->Publish(m_orderedLogWindow.GetLogArena());
-
-					if (state != LogPublishState::SUCCESS)
-					{
-						return state;
-					}
-				}
-
-				return LogPublishState::SUCCESS;
-			});
-
-		break;
-	}
-
-	case LogTrackerState::TRACKED_WITH_MISSING :
-	{
-		uint64_t missing = m_orderedLogWindow.GetFirstMissingSequenceAfter(PublishCursor_End);
-
-		if (missing != InvalidSequenceNumber)
+	const OrderedLogWindow::ConsumePassResult result = m_orderedLogWindow.ConsumePass([&](LogArena& Arena)
 		{
-			if (missing == trackedData.Sequence_Begin)
+			LogPublishState state;
+			for (auto sink : m_sinks)
 			{
-				break;
-			}
-			PublishCursor_End = missing - 1;
-		}
+				state = sink->Publish(Arena);
 
-		LogPublishState publishState = m_orderedLogWindow.PublishLogData(PublishCursor_End,
-			[this](LogArena& InLogArena)
-			{
-				for (auto& sink : m_sinks)
-				{
-					LogPublishState state = sink->Publish(m_orderedLogWindow.GetLogArena());
-
-					if (state != LogPublishState::SUCCESS)
-					{
-						return state;
-					}
-				}
-
-				return LogPublishState::SUCCESS;
-			});
-
-
-
-		if (!trackedData.Sequence_Missing.empty())
-		{
-			missing = m_orderedLogWindow.GetFirstMissingSequenceAfter(PublishCursor_End);
-
-			const OrderedLogSlot* validSlotAfterMissing = m_orderedLogWindow.GetFirstValidLogSlotAfter(missing);
-
-			if (validSlotAfterMissing == nullptr)
-			{
-				__debugbreak();
-				assert(false);
-				return;
+				if (state != LogPublishState::SUCCESS) assert(false && "Logger Sink failed to publish");
 			}
 
-			auto timeStamp = validSlotAfterMissing->Data->Time;
+			return state;
+		});
 
-			// Sleep for the Grace Period
-			//std::cout << "Sleeping............" << std::endl;
-			std::this_thread::sleep_until(timeStamp + std::chrono::milliseconds(1));
+	switch (result.State)
+	{
+	case LogPublishState::SUCCESS_WITH_MISSING :
+	{
+		NX_TimePoint now = NX_Clock::now();
+		auto timeout = m_orderedLogWindow.GetGapTimeout();
+		auto gapSince = m_orderedLogWindow.GetGapSince();
+
+		if (result.PublishedCount == 0)
+		{
+			m_highResTimer.SleepForMicroseconds(100); // Queues are empty
 		}
-
-		PublishCursor_End = trackedData.Sequence_End;
-
+		else
+		{
+			for (int i = 0; i < 16; ++i) _mm_pause();
+		}
 		break;
 	}
 
-	case LogTrackerState::FAILURE_EMPTY :
+	case LogPublishState::FAILURE_EMPTY :
 	{
-		//std::cout << "Sleeping............" << std::endl;
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
+		m_highResTimer.SleepForMicroseconds(100);
 		break;
 	}
 
-	default:
+	default :
 	{
-		//std::cout << "FAILED TO PUBLISH" << std::endl;
+		assert(false && "Logger: Invalid internal state");
 		break;
 	}
-
 	}
 }

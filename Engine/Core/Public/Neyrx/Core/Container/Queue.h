@@ -6,7 +6,7 @@
 #include <atomic>
 #include <iostream> // TODO - remove (TEMP)
 
-namespace Neyrx
+namespace Neyrx::Container
 {
 	// ==========================================================
 	// RingBuffer Iterator

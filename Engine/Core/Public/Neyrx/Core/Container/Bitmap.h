@@ -6,31 +6,10 @@
 #include <algorithm>
 #include <cassert>
 
-namespace Neyrx::Bitmap
+#include "Neyrx/Core/Container/SequenceStatus.h"
+
+namespace Neyrx::Container
 {
-	enum class SequenceStatus : uint8_t
-	{
-		Accepted,			// Valid, newly marked/inserted
-		Duplicate,			// Already marked/seen
-		Stale,				// Preceeds the window head (already retired/expired)
-		BeyondCapacity		// Beyond the window limit (packet too far in the future)
-	};
-
-
-	[[nodiscard]] constexpr bool IsSuccess(SequenceStatus Status) noexcept
-	{
-		return Status == SequenceStatus::Accepted;
-	}
-
-
-	[[nodiscard]] constexpr bool IsRejected(SequenceStatus Status) noexcept
-	{
-		return Status != SequenceStatus::Accepted;
-	}
-
-
-
-
 	// ======================================================================================================
 	// Sliding Reorder Bitmap (consumer-thread only, O(1) mark, word-wise scan/clear)
 	//
@@ -62,38 +41,45 @@ namespace Neyrx::Bitmap
 		// Returns true if Sequence is inside the window.
 		[[nodiscard]] bool IsInsideWindow(uint64_t Sequence) const noexcept
 		{
+			// Unsigned wrap makes Sequence < head produce a huge value, so one compare covers both ends.
 			return static_cast<uint64_t>(Sequence - m_windowHead) < WindowSize;
 		}
 
-		// Marks a sequence as received.
-		// Returns SequenceStatus::Accepted, Duplicate, Stale, or BeyondCapacity.
-		[[nordiscard]] SequenceStatus MarkReceived(uint64_t Sequence) noexcept
+
+		// Classifies a sequence against the window without modifying anything.
+		//   Stale          : behind the head (already retired). Always wins over Duplicate.
+		//   BeyondCapacity : at or past head + WindowSize.
+		//   Duplicate      : inside the window and already marked.
+		//   Accepted       : inside the window and not yet marked.
+		[[nodiscard]] constexpr SequenceStatus Classify(uint64_t Sequence) const noexcept
 		{
 			uint64_t diff = Sequence - m_windowHead;
 
 			if (diff >= WindowSize)
 			{
-				return (diff >= (1ULL << 63)) ? SequenceStatus::Stale : SequenceStatus::BeyondCapacity;
+				return (diff >= HalfRange) ? SequenceStatus::Stale : SequenceStatus::BeyondCapacity;
 			}
 
-			uint64_t wordIdx = (Sequence >> 6) & WordMask;
-			uint64_t mask = 1ULL << (Sequence & 63);
+			return IsReceived(Sequence) ? SequenceStatus::Duplicate : SequenceStatus::Accepted;
+		}
 
-			// If the bit is already 1, its a duplicate
-			if (m_words[wordIdx] & mask) return SequenceStatus::Duplicate;
+		// Marks a sequence as received. The bit is only set when the result is Accepted.
+		[[nodiscard]] SequenceStatus MarkReceived(uint64_t Sequence) noexcept
+		{
+			const SequenceStatus status = Classify(Sequence);
 
-			// Mark as recieved
-			m_words[wordIdx] |= mask;
-			return SequenceStatus::Accepted;
+			if (status != SequenceStatus::Accepted) return status;
+
+			m_words[(Sequence >> 6) & WordMask] |= 1ULL << (Sequence & 63);
+
+			return status;
 		}
 
 
 		// Returns true if Sequence State is set to true.
-		[[nordiscard]]  bool IsReceived(uint64_t Sequence) const noexcept
+		[[nodiscard]]  bool IsReceived(uint64_t Sequence) const noexcept
 		{
-			if (!IsInsideWindow(Sequence)) return false;
-
-			return (m_words[(Sequence >> 6) & WordMask] >> (Sequence & 63)) & 1ULL;
+			return IsInsideWindow(Sequence) && TestBit(Sequence);
 		}
 
 
@@ -108,8 +94,7 @@ namespace Neyrx::Bitmap
 				uint64_t wordIdx = (seq >> 6) & WordMask;
 				uint64_t bitOffset = seq & 63;
 
-				// Shift bit offsets below seq;
-				// vacated high bits are zero, so run <= 64 - bitOffset.
+				// Shift bit offsets below seq; vacated high bits are zero, so run <= 64 - bitOffset.
 				uint64_t word = m_words[wordIdx] >> bitOffset;
 
 				uint64_t run = static_cast<uint64_t>(std::countr_one(word));
@@ -135,7 +120,7 @@ namespace Neyrx::Bitmap
 
 			while (Count > 0)
 			{
-				std::size_t wordIdx = (m_windowHead >> 6) & WindowMask;
+				std::size_t wordIdx = (m_windowHead >> 6) & WordMask;
 				std::size_t bitOffset = m_windowHead & 63;
 
 				std::size_t bits = std::min<uint64_t>(Count, 64 - bitOffset);
@@ -156,6 +141,14 @@ namespace Neyrx::Bitmap
 
 
 	private:
+
+		static constexpr uint64_t HalfRange = 1ULL << 63;
+
+		// Unchecked called garuntees sequence is inside the window
+		[[nodiscard]] bool TestBit(uint64_t Sequence) const noexcept
+		{
+			return (m_words[(Sequence >> 6) & WordMask] >> (Sequence & 63)) & 1ULL;
+		}
 
 		std::array<uint64_t, WordCount> m_words{};
 		uint64_t m_windowHead = 0;

@@ -1,4 +1,4 @@
-#include "Neyrx/Time/NX_Time.h"
+#include "Neyrx/Core/Time/NX_Time.h"
 #include <cassert>
 
 

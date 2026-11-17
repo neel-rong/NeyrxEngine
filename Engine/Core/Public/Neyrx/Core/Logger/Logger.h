@@ -5,10 +5,12 @@
 #include <thread>
 #include <cassert>
 #include <semaphore>
+#include <Windows.h>
 
 #include "Neyrx/Core/Container/Queue.h"
 #include "Neyrx/Core/Logger/LogDataStructures.h"
 #include "Neyrx/Core/Logger/Sink.h"
+#include "Neyrx/Core/Time/NX_HighResTimer.h"
 
 #include <iostream>// temp
 #include <stdio.h> // temp
@@ -66,7 +68,7 @@ namespace Neyrx::Logger
 				"Argument count exceeded limit of 8");
 
 
-			const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+			const NX_TimePoint start = NX_Clock::now();
 
 			uint64_t sequenceNumber = m_globalSequenceNumber.fetch_add(1, std::memory_order_relaxed);
 
@@ -85,7 +87,7 @@ namespace Neyrx::Logger
 				std::cout << "Queue Failed for Seq: " << sequenceNumber << "\n";
 			}
 
-			const std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+			const NX_TimePoint end = NX_Clock::now();
 
 			const auto& duration = end - start;
 			if (duration > std::chrono::milliseconds(1))
@@ -110,6 +112,8 @@ namespace Neyrx::Logger
 
 		std::vector<ILoggerSink*> m_sinks;
 
+		HighResTimer m_highResTimer;
+
 		uint64_t PublishCursor_Start = InvalidSequenceNumber;
 		uint64_t PublishCursor_End = InvalidSequenceNumber;
 	};
@@ -127,4 +131,4 @@ extern Neyrx::Logger::Logger NX_Logger;
 
 #define NX_LOG_TEMP Neyrx::Logger::LogCategory::Temp
 
-#define NX_LOG(CATEGORY, LEVEL, FORMAT, ...)  NX_Logger.QueueMessage<FORMAT>(CATEGORY, LEVEL, __VA_ARGS__);
+#define NX_LOG(CATEGORY, LEVEL, FORMAT, ...)  NX_Logger.QueueMessage<FORMAT>(CATEGORY, LEVEL __VA_OPT__(,) __VA_ARGS__);

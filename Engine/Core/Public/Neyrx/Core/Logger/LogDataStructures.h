@@ -1,10 +1,12 @@
 #pragma once
 
-#include<string>
-#include<chrono>
-#include<array>
+#include <string>
+#include <chrono>
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
+#include <cstring>
 #include <type_traits>
 #include <charconv>
 #include <stdexcept>
@@ -14,30 +16,42 @@
 #include <concepts>
 #include <functional>
 #include <limits>
+#include <span>
+#include <bit>
+#include <thread>
 
 #include "Neyrx/Core/Container/Queue.h"
-#include "Neyrx/Time/NX_Time.h"
+#include "Neyrx/Core/Container/Bitmap.h"
+#include "Neyrx/Core/Container/ReorderBuffer.h"
+#include "Neyrx/Core/Time/NX_Time.h"
 
 
 #include <stdio.h>			// Temp
 #include <iostream>			// Temp
-#include <thread>
 
 
 // Temporary Global Variables
-inline constexpr uint64_t InvalidSequenceNumber = std::numeric_limits<uint64_t>::max();
-inline constexpr uint64_t Invalidindex = std::numeric_limits<uint64_t>::max();
+inline constexpr uint64_t InvalidSequenceNumber = (std::numeric_limits<uint64_t>::max)();
+inline constexpr uint64_t InvalidIndex = (std::numeric_limits<uint64_t>::max)();
 
 inline constexpr std::size_t NumberOfThreads = 6;
 inline constexpr std::size_t ThreadQueueSize = 16384;
 
-inline constexpr std::size_t MaxLogArguments = 8;
+inline constexpr std::size_t g_maxLogArgumentCount = 8;
+inline constexpr std::size_t g_maxStringArgumentLength = 1024;		// Longer strings are truncated
+inline constexpr std::size_t g_maxLogFormatStringLength = 4096;
+inline constexpr std::size_t g_OrderedLogCapacity = 4096;			// reorder window, not total in-flight
 
-inline constexpr std::size_t g_OrderedLogCapacity = ThreadQueueSize * NumberOfThreads;
-inline constexpr std::size_t g_estimatedLogStringSize = 1024;
+inline constexpr std::size_t g_logArenaCapacity = 512 * 1024;
+
+static_assert(std::has_single_bit(g_OrderedLogCapacity) && g_OrderedLogCapacity >= 64,
+	"g_OrderedLogCapacity must be a power of two >= 64");
+static_assert(g_logArenaCapacity >= g_maxLogFormatStringLength + (g_maxStringArgumentLength * g_maxLogArgumentCount),
+	"g_logArenaCapacity exceeded");
 
 
 using namespace Neyrx::Time;
+using namespace Neyrx::Container;
 
 
 namespace Neyrx::Logger
@@ -254,6 +268,34 @@ X(Temp)							\
 
 
 	// ==========================================================================================================
+	// Fixed String
+	// ==========================================================================================================
+
+	// Preflighted entry formatter
+	struct StringRef
+	{
+		const char* Ptr;
+		std::size_t Length;
+	};
+
+
+	static StringRef MakeStringRef(const char* String) noexcept
+	{
+		if (String == nullptr) return { "(null)", 6 };
+
+		const void* end = std::memchr(String, 0, g_maxStringArgumentLength);
+
+		std::size_t len = end
+			? static_cast<std::size_t>(static_cast<const char*>(end) - String)
+			: g_maxStringArgumentLength;			// truncate long strings
+
+		return { String, len };
+	}
+
+
+
+
+	// ==========================================================================================================
 	// Log Format Operations
 	// ==========================================================================================================
 
@@ -324,18 +366,13 @@ X(Temp)							\
 	consteval std::size_t GetSpecifierCount()
 	{
 		std::size_t count = 0;
-		for (std::size_t i = 0; i < Format.size(); ++i)
+		for (std::size_t i = 0; i < Format.size();)
 		{
-			if (Format.Value[i] != '%')
-			{
-				continue;
-			}
-			else if (i + 1 > Format.size())
-			{
-				throw "Invalid Log format";
-			}
+			if (Format.Value[i] != '%') { ++i; continue; }
+			if (i + 1 > Format.size()) throw "Invalid log format";
+			if (Format.Value[i + 1] != '%') ++count;		// % not included in argument count
 
-			++count;
+			i += 2;
 		}
 
 		return count;
@@ -586,11 +623,6 @@ X(Temp)							\
 				++metadata.LogSize;
 			}
 
-			if (index + 2 >= Format.size())
-			{
-				break;
-			}
-
 			index += 2;
 		}
 
@@ -609,9 +641,19 @@ X(Temp)							\
 
 		++metadata.LogSize; // Increment for line ending
 
-		if (metadata.LogSize > g_estimatedLogStringSize)
+		if (metadata.LogSize > g_maxLogFormatStringLength)
 		{
 			throw "Log format exceeds maximum estimated log string size";
+		}
+
+		if (metadata.ArgumentCount != sizeof...(Args))
+		{
+			throw "Invalid log format: Argument count mismatch";
+		}
+
+		if (metadata.ArgumentCount > g_maxLogArgumentCount)
+		{
+			throw "Invalid log format: Argument count exceeds the limit";
 		}
 
 		return metadata;
@@ -767,6 +809,11 @@ X(Temp)							\
 				destination.ArgType = LogArgumentType::Character;
 				destination.ArgValue.Character = InArgument;
 			}
+			else if constexpr (std::is_same_v<Type, std::string>)
+			{
+				destination.ArgType = LogArgumentType::StringLiteral;
+				destination.ArgValue.StringLiteral = InArgument;
+			}
 			else
 			{
 				static_assert(!sizeof(Type), "Unsupported log argument type");
@@ -780,7 +827,7 @@ X(Temp)							\
 
 		const char* LogFormatString = nullptr;
 		const LogFormatOperation* LogOperations = nullptr;
-		std::array<LogArgument, MaxLogArguments> LogArguments{};
+		std::array<LogArgument, g_maxLogArgumentCount> LogArguments{};
 
 		std::size_t OperationCount = 0;
 		std::size_t ArgumentCount = 0;
@@ -797,61 +844,94 @@ X(Temp)							\
 	// Log Arena
 	// ==========================================================================================================
 
-	struct LogArena
+	class LogArena
 	{
 	public:
 
-		LogArena() = default;
+		LogArena() : m_data(std::make_unique_for_overwrite<char[]>(g_logArenaCapacity))
+		{
+			// One time pre-fault so the first fill doesn't pay page faults on the hot path.
+			std::memset(m_data.get(), 0, g_logArenaCapacity);
+		}
 
-		void Initialize();
-		void Reset();
+		LogArena(const LogArena&) = delete;
+		LogArena& operator=(LogArena&) = delete;
+		LogArena(LogArena&&) noexcept = default;
+		LogArena& operator=(LogArena&&) noexcept= default;
 
-		std::size_t GetSize() const;
-		std::size_t GetArenaStart() const;
-		std::size_t GetArenaEnd() const;
-		char* GetHeadData();
+		// State ---------------------------------------------------------------------------------
+		[[nodiscard]] inline std::size_t GetSize() const noexcept { return m_cursor; }
+		[[nodiscard]] inline std::size_t GetCapacity() const noexcept{ return g_logArenaCapacity; }
+		[[nodiscard]] inline std::size_t GetRemaining() const noexcept { return g_logArenaCapacity - m_cursor; }
+		[[nodiscard]] inline bool IsEmpty() const noexcept { return m_cursor == 0; }
 
-		bool IsEmpty() const;
-		bool IsFull() const;
-		bool HasCapacityFor(std::size_t InLength) const;
+		// Overflow-safe: compares against the remainder, never adds to the cursor.
+		[[nodiscard]] bool HasCapacityFor(uint64_t Length) const noexcept
+		{
+			return GetRemaining() >= Length;
+		}
 
-		void Clear();
+		// The contiguous block of formatted data
+		[[nodiscard]] std::span<const char> GetData() const noexcept { return { m_data.get(), m_cursor }; }
 
+		void Clear() noexcept { m_cursor = 0; }
+
+		uint64_t GetMark() const noexcept { return m_cursor; }
+
+		// Truncate to Mark
+		void Truncate(uint64_t Mark)
+		{
+			assert(Mark <= m_cursor);
+
+			m_cursor = Mark;
+		}
+
+		// Appends ---------------------------------------------------------------------------------
+
+		// Append after check
 		bool AppendToArena_Literal(const char* InData, std::size_t InLength);
 
+		// Append without a check, caller ensures to preflight capacity
+		void AppendUncheked(const char* Data, std::size_t  Length) noexcept;
+		void AppendCharUncheked(char Character) noexcept;
+
+
+		// Formats into the arena without any scratch buffer or a second copy.
+		// to_chars is parsed with the end of the arena, so it is inherently bounds safe:
+		// a value that doesn't fit returns false and writes nothing we keep.
 		template<typename Number>
 			requires (
 		(std::integral<std::remove_cvref_t<Number>> &&
 			!std::same_as<std::remove_cvref_t<Number>, bool>) ||
-		std::floating_point<std::remove_cvref_t<Number>>)
-		bool AppendToArena_Numeric(
-			const Number& InNumber,
-			const int Base = 10,
-			const std::chars_format Format = std::chars_format::general)
+			std::floating_point<std::remove_cvref_t<Number>>)
+			bool AppendToArena_Numeric(
+				const Number& InNumber,
+				const int Base = 10,
+				const std::chars_format Format = std::chars_format::general)
 		{
 			using Type = std::remove_cvref_t<Number>;
 
-			constexpr std::size_t reqSize = GetMaxFormattedSize<Type>();
-			static_assert(reqSize <= m_formatBufferSize);
+			static_assert(GetMaxFormattedSize<Type>() <= g_logArenaCapacity);
 
-			auto* fBuffer = m_numericFormatBuffer.data();
+			char* start = m_data.get() + m_cursor;
+			char* end = m_data.get() + g_logArenaCapacity;
 
 			std::to_chars_result result{};
 
 			if constexpr (std::integral<Type>)
 			{
-				if (Base < 2 || Base > 36)
-					return false;
+				assert(Base >= 2 && Base <= 36);
+				if (Base < 2 || Base > 36) return false;
 
-				result = std::to_chars(fBuffer,
-					fBuffer + reqSize,
+				result = std::to_chars(start,
+					end,
 					InNumber,
 					Base);
 			}
 			else if constexpr (std::floating_point<Type>)
 			{
-				result = std::to_chars(fBuffer,
-					fBuffer + reqSize,
+				result = std::to_chars(start,
+					end,
 					InNumber,
 					Format);
 			}
@@ -862,28 +942,16 @@ X(Temp)							\
 				return false;
 			}
 
-			const std::size_t written = static_cast<std::size_t>(result.ptr - fBuffer);
-
-			if (!HasCapacityFor(written)) return false;
-
-			return AppendToArena_Literal(fBuffer, written);
+			m_cursor += static_cast<std::size_t>(result.ptr - start);
+			return true;
 		}
+
 
 	private:
 
-		// Private Members
-
-		static constexpr std::size_t m_formatBufferSize = 128;
-
-		using Buffer = RingBuffer<char, g_OrderedLogCapacity* g_estimatedLogStringSize>;
-
-		std::unique_ptr<Buffer> m_arenaBuffer = std::make_unique<Buffer>();
-		std::array<char, m_formatBufferSize> m_numericFormatBuffer{ };
+		std::unique_ptr<char[]> m_data;
+		std::size_t m_cursor = 0;
 	};
-
-
-
-
 
 
 
@@ -915,7 +983,7 @@ X(Temp)							\
 
 		inline const std::size_t GetThreadIndex(const LogThreadContext* Context) const
 		{
-			std::size_t index = Invalidindex;
+			std::size_t index = InvalidIndex;
 
 			for (std::size_t i = 0; i < m_threadContexts.size(); ++i)
 			{
@@ -934,199 +1002,6 @@ X(Temp)							\
 
 
 	// ==========================================================================================================
-	// Ordered Log Slot
-	// ==========================================================================================================
-
-	struct OrderedLogSlot
-	{
-		OrderedLogSlot() = default;
-
-		OrderedLogSlot(std::size_t InOffset, std::size_t InLength, uint64_t InSequenceNumber, LogData* InData) :
-			Offset(InOffset), Length(InLength), SequenceNumber(InSequenceNumber), Data(InData) {
-		}
-
-		OrderedLogSlot(uint64_t InSequenceNumber) : Offset(0), Length(0), SequenceNumber(InSequenceNumber), Data(nullptr) {}
-
-		std::size_t Offset = 0;
-		std::size_t Length = 0;
-		uint64_t SequenceNumber = InvalidSequenceNumber;
-		LogData* Data = nullptr;
-	};
-
-
-
-
-	// ==========================================================================================================
-	// Tracked Log Data
-	// ==========================================================================================================
-
-	struct TrackedLogData
-	{
-		TrackedLogData()
-		{
-			Sequence_Missing.reserve(g_OrderedLogCapacity);
-		}
-
-		// Begin and End are set to InvalidSequenceNumber when nothing is tracked.
-		// They are also invalid when UNINITIALIZED.
-
-		// But if Begin and End are InvalidSequenceNumber,
-		// while MaxTracked is not InvalidSequenceNumber
-		// Then there is nothing being tracked, but the data strucutre has been initialized
-		uint64_t Sequence_Begin = InvalidSequenceNumber;
-		uint64_t Sequence_End = InvalidSequenceNumber;
-
-		// Sequence_MaxTracked is a presistent Member variable that retains its value even after a flush
-		// Keeps track of the Max Sequence Number that has been tracked since initialization
-		uint64_t Sequence_MaxTracked = InvalidSequenceNumber;
-
-		std::vector<uint64_t> Sequence_Missing{};
-
-		inline LogTrackerState GetTrackerState() const
-		{
-			if (Sequence_MaxTracked == InvalidSequenceNumber) return LogTrackerState::UNINITIALIZED;
-
-			if (Sequence_Begin == InvalidSequenceNumber && Sequence_End == InvalidSequenceNumber) return LogTrackerState::UNTRACKED;
-
-			if (Sequence_Begin == InvalidSequenceNumber && Sequence_End != InvalidSequenceNumber) return LogTrackerState::INVALID_STATE;
-			if (Sequence_Begin != InvalidSequenceNumber && Sequence_End == InvalidSequenceNumber) return LogTrackerState::INVALID_STATE;
-			if (Sequence_Begin > Sequence_MaxTracked || Sequence_End != Sequence_MaxTracked) return LogTrackerState::INVALID_STATE;
-			if (Sequence_Begin > Sequence_End) return LogTrackerState::INVALID_STATE;
-
-			if (Sequence_Missing.size() != 0) return LogTrackerState::TRACKED_WITH_MISSING;
-			if (Sequence_Missing.size() == 0) return LogTrackerState::TRACKED_ALL;
-
-			return LogTrackerState::INVALID_STATE;
-		}
-	};
-
-
-
-
-	// ==========================================================================================================
-	// Sliding Bitmap
-	// ==========================================================================================================
-
-	class SlidingBitmap
-	{
-
-	};
-
-
-
-	// ==========================================================================================================
-	// Ordered Log Buffer
-	// ==========================================================================================================
-
-	struct OrderedLogBuffer
-	{
-		static constexpr std::size_t Capacity = g_OrderedLogCapacity;
-
-		// =====================================
-		// Buffer Position
-		// =====================================
-
-		struct BufferPosition
-		{
-			BufferPosition() = default;
-			BufferPosition(std::size_t InChunkIndex, std::size_t InOffset) :
-				ChunkIndex(InChunkIndex),
-				Offset(InOffset) {
-			}
-
-			std::size_t ChunkIndex = Invalidindex;
-			std::size_t Offset = Invalidindex;
-
-
-			inline bool IsValid() const
-			{
-				return ChunkIndex < m_orderedLogBufferChunkCount &&
-					Offset < Capacity;
-			}
-		};
-
-
-		struct ReservedLogData
-		{
-			ReservedLogData() = default;
-
-			// Sequence number corresponding to BufferIndexStart.
-			// Advances when the oldest reserved slots are removed.
-			// Retains its last value when the buffer becomes empty.
-			uint64_t SequenceNumber_Start = InvalidSequenceNumber;	// Denotes the present reserved start sequence number. Set to invalid Sequnce Number when nothing is reserved
-			uint64_t SequenceNumber_End = InvalidSequenceNumber;	// Denotes the present reserved end sequence number. Set to invalid Sequnce Number when nothing is reserved
-			uint64_t SequenceNumber_Max = InvalidSequenceNumber;	// Denotes the last Max Sequence Number that has been reserved. Value does not change when nothing is reserved
-
-			LogReserveState GetLogReserveState() const
-			{
-				if (SequenceNumber_Max == InvalidSequenceNumber) return LogReserveState::UNINITIALIZED;
-
-				if (SequenceNumber_Start == InvalidSequenceNumber && SequenceNumber_End == InvalidSequenceNumber) return LogReserveState::UNRESERVED;
-
-				if (SequenceNumber_Start != InvalidSequenceNumber && SequenceNumber_End == InvalidSequenceNumber) return LogReserveState::INVALID_INTERNAL_STATE;
-				if (SequenceNumber_Start == InvalidSequenceNumber && SequenceNumber_End != InvalidSequenceNumber) return LogReserveState::INVALID_INTERNAL_STATE;
-				if (SequenceNumber_Start != InvalidSequenceNumber && SequenceNumber_End != InvalidSequenceNumber
-					&& SequenceNumber_Max == InvalidSequenceNumber) return LogReserveState::INVALID_INTERNAL_STATE;
-				if (SequenceNumber_Start > SequenceNumber_Max || SequenceNumber_End > SequenceNumber_Max) return LogReserveState::INVALID_INTERNAL_STATE;
-
-				if (SequenceNumber_Start <= SequenceNumber_End) return LogReserveState::RESERVED;
-
-				return LogReserveState::INVALID_INTERNAL_STATE;
-			}
-		};
-
-		// =====================================
-		// Functions
-		// =====================================
-
-		LogReserveState GetReserveState();
-
-		uint64_t GetEndReservedSequenceNumber() const;
-		uint64_t GetStartReservedSequenceNumber() const;
-		uint64_t GetMaxReservedSequenceNumber() const;
-		inline const auto& GetOrderedLogBuffers() const { return &OrderedLogBuffers; }
-
-		std::size_t GetSize() const;
-		bool IsEmpty() const;
-		bool HasFreeChunk() const;		// Returns ture if the present write chunk or the next chunk is empty
-
-		void IncrementBufferPosition(BufferPosition& OutBufferPosition);
-		BufferPosition GetBufferPosition(const uint64_t SequenceNumber) const;
-
-		OrderedLogSlot* GetReservedSlot(const uint64_t SequenceNumber);
-		const OrderedLogSlot* GetReservedSlot(const uint64_t SequenceNumber) const;
-
-		// Derserves the Buffer from the OldestReservedSequence to EndSequenceNumber
-		LogReserveState DereserveSequences(uint64_t EndSequenceNumber);
-
-		// Reserves Capacity(value of) consecutive sequence numbers in the ordered buffer.
-		LogReserveState ReserveSequences(const uint64_t StartSequenceNumber);
-
-
-
-	private:
-
-		// =====================================
-		// Member Parameters
-		// =====================================
-
-		static constexpr std::size_t m_orderedLogBufferChunkCount = 3;
-
-		using Buffer = std::array<std::array <OrderedLogSlot, Capacity>, m_orderedLogBufferChunkCount>;
-
-		std::unique_ptr<Buffer> OrderedLogBuffers = std::make_unique<Buffer>();
-
-		BufferPosition m_bufferIndexStart{ 0 ,0 };								// Physical position of the oldest live reserved slot.
-		BufferPosition m_bufferWriteCursor{ 0, 0 };								// Physical position of the next slot to reserve.
-		std::array<std::size_t, m_orderedLogBufferChunkCount> m_bufferSize{ };	// The present size of each buffer
-
-		ReservedLogData m_reservedLogData;
-	};
-
-
-
-
-	// ==========================================================================================================
 	// Ordered Log Window
 	// ==========================================================================================================
 
@@ -1136,33 +1011,30 @@ X(Temp)							\
 
 		OrderedLogWindow() = default;
 
-		// Public Member
+		// Public Member -------------------------------------------------------------------------------------------------------------
 		static constexpr std::size_t Capacity = g_OrderedLogCapacity;
 
 
-		// Public Functions
+		// Consume Pass Result -------------------------------------------------------------------------------------------------------
+
+		struct ConsumePassResult
+		{
+			LogPublishState State = LogPublishState::UNINITIALIZED;
+			uint64_t PublishedCount = 0;		// Entries formatted and published this pass
+			bool bGapActive = false;			// Head is missing, later sequences exist
+			bool bQueuesEmpty = false;			// All thread context queues are empty
+		};
+
+
+		// Public Functions ----------------------------------------------------------------------------------------------------------
 
 		void Initialize(LoggerThreadRegistry* InLoggerState);
 
-		const OrderedLogSlot* GetFirstAccountedLogSlot() const;
-		uint64_t GetFirstMissingSequenceAfter(uint64_t SequenceNumber) const;
-		uint64_t GetFirstValidSequenceAfter(uint64_t SequenceNumber) const;
-		const OrderedLogSlot* GetFirstValidLogSlotAfter(uint64_t SequenceNumber) const;
-		uint64_t GetMaxReservedSequence() const;
-
-		uint64_t GetInvertedCount() const;
-		uint64_t GetSkippedCount() const;
-
-		bool IsSequencesMissing();
-		bool IsEmpty() const;
-
-		const OrderedLogSlot* GetTrackedSlot(uint64_t SequenceNumber) const;
-		const TrackedLogData& GetTrackedLogData() const;
+		uint64_t GetSkippedCount();
+		uint64_t GetInvertedCount();
+		NX_TimePoint GetGapSince();
+		std::chrono::microseconds GetGapTimeout();
 		LogArena& GetLogArena();
-
-		LogReserveState ReserveLogSlotsForTracking();
-
-		LogFormatState FormatLogDataToArena(uint64_t EndSequenceNumber, std::size_t& OutMissingSequenceCount);
 		LogFormatState FormatLogDataToArena(LogData* Data);
 
 
@@ -1170,14 +1042,41 @@ X(Temp)							\
 		// Template Functions --------------------------------------------------------------------------------------------------------
 		// ---------------------------------------------------------------------------------------------------------------------------
 
-		// Execute Log Format Operations Recurssive ----------------------------------------------------------------------------------
+		// Execute Log Format Operations ---------------------------------------------------------------------------------------------
 
-		bool ExecuteLogFormatOperations(
+		LogFormatState ExecuteLogFormatOperations(
 			const char* FormatString,
 			LogArgument* InArguments,
 			const LogFormatOperation* FormatOperations,
-			std::size_t OperationCount)
+			std::size_t OperationCount,
+			std::size_t StaticSize,
+			std::size_t StringArgumentCount)
 		{
+			// Preflight: one strlen per string argument, lengths kept for the write pass
+
+			std::array<StringRef, g_maxLogArgumentCount> strings;
+			std::size_t need = StaticSize;
+
+			if (StringArgumentCount > 0)
+			{
+				std::size_t k = 0;
+
+				for (std::size_t i = 0; i < OperationCount; ++i)
+				{
+					if (FormatOperations[i].Type != LogFormatOpType::ArgumentLiteral) continue;
+
+					StringRef ref = MakeStringRef(InArguments[FormatOperations[i].ArgumentIndex].ArgValue.StringLiteral);
+					need += ref.Length;
+					++k;
+				}
+			}
+
+			if (!m_logArena.HasCapacityFor(need)) return LogFormatState::FAILURE_CAPACITY;
+
+			const size_t mark = m_logArena.GetMark();
+			std::size_t stringIdx = 0;
+			bool result = true;
+
 			for (std::size_t OperationIndex = 0; OperationIndex < OperationCount; ++OperationIndex)
 			{
 				const auto& op = FormatOperations[OperationIndex];
@@ -1186,41 +1085,31 @@ X(Temp)							\
 				{
 				case LogFormatOpType::FormatLiteral:
 				{
-					if (!m_logArena.AppendToArena_Literal(FormatString + op.Offset, op.Length))
-						return false;
-
+					m_logArena.AppendUncheked(FormatString + op.Offset, op.Length);
 					break;
 				}
 
 				case LogFormatOpType::SignedInteger :
 				{
-					if (!m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.SignedInteger))
-						return false;
-
+					result = m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.SignedInteger);
 					break;
 				}
 
 				case LogFormatOpType::UnsignedInteger :
 				{
-					if (!m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.UnsignedInteger))
-						return false;
-
+					result = m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.UnsignedInteger);
 					break;
 				}
 
 				case LogFormatOpType::Float :
 				{
-					if (!m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.FloatValue))
-						return false;
-
+					result = m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.FloatValue);
 					break;
 				}
 
 				case LogFormatOpType::Double :
 				{
-					if (!m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.DoubleValue))
-						return false;
-
+					result = m_logArena.AppendToArena_Numeric(InArguments[op.ArgumentIndex].ArgValue.DoubleValue);
 					break;
 				}
 
@@ -1228,13 +1117,9 @@ X(Temp)							\
 				{
 					const bool value = InArguments[op.ArgumentIndex].ArgValue.BooleanValue;
 
-					if (!m_logArena.AppendToArena_Literal(
+					m_logArena.AppendUncheked(
 						value ? "true" : "false",
-						value ? 4 : 5))
-					{
-						return false;
-					}
-
+						value ? 4 : 5);
 					break;
 				}
 
@@ -1242,26 +1127,16 @@ X(Temp)							\
 				{
 					const auto& character = InArguments[op.ArgumentIndex].ArgValue.Character;
 
-					if (!m_logArena.AppendToArena_Literal(&character, 1))
-						return false;
-
+					result = m_logArena.AppendToArena_Literal(&character, 1);
 					break;
 				}
 
 				case LogFormatOpType::ArgumentLiteral :
 				{
 					const auto& argument = InArguments[op.ArgumentIndex];
-					const char* string = argument.ArgValue.StringLiteral;
+					const StringRef stringRef = MakeStringRef(argument.ArgValue.StringLiteral);
 
-					if (string == nullptr)
-					{
-						assert(false && "null string passed to logger");
-						return false;
-					}
-
-					const std::size_t length = std::char_traits<char>::length(string);
-
-					if (!m_logArena.AppendToArena_Literal(string, length)) return false;
+					m_logArena.AppendUncheked(stringRef.Ptr, stringRef.Length);
 
 					break;
 				}
@@ -1272,8 +1147,7 @@ X(Temp)							\
 
 					if (argument.ArgValue.Pointer == nullptr)
 					{
-						if (!m_logArena.AppendToArena_Literal("nullptr", 7))
-							return false;
+						m_logArena.AppendUncheked("nullptr", 7);
 					}
 					else
 					{
@@ -1281,11 +1155,8 @@ X(Temp)							\
 							argument.ArgValue.Pointer
 							);
 
-						if (!m_logArena.AppendToArena_Literal("0x", 2))
-							return false;
-
-						if (!m_logArena.AppendToArena_Numeric(pointer, 16))
-							return false;
+						m_logArena.AppendUncheked("0x", 2);
+						result = m_logArena.AppendToArena_Numeric(pointer, 16);
 					}
 
 					break;
@@ -1293,391 +1164,234 @@ X(Temp)							\
 
 				case LogFormatOpType::EscapedPercent :
 				{
-					if (!m_logArena.AppendToArena_Literal("%", 1))
-						return false;
-
+					m_logArena.AppendUncheked("%", 1);
 					break;
 				}
 
 				default :
 				{
-					throw "Invalid log format";
+					result = false;
+					break;
 				}
 				}
 			}
 
+			if (!result)
+			{
+				m_logArena.Truncate(mark);
+				return LogFormatState::INVALID_INTERNAL_STATE;
+			}
+
+
+			return LogFormatState::SUCCESS;
+		}
+
+
+
+
+		// Flush Arena ---------------------------------------------------------------------------------------------------------------
+
+		template<typename Publisher>
+		bool FlushArena(Publisher&& Publish)
+		{
+			if (m_logArena.IsEmpty()) return true;
+			if (Publish(m_logArena) != LogPublishState::SUCCESS) return false;
+
+			m_logArena.Clear();
 			return true;
 		}
 
 
+		// FormatOrFlush -------------------------------------------------------------------------------------------------------------
 
-
-		// Track Log Data ------------------------------------------------------------------------------------------------------------
-
-		LogTrackerState TrackLogData()
+		// For entries formatted outside the ordered drain (late/stale entries).
+		template<typename Publisher>
+		bool FormatOrFlush(LogData& Data, Publisher&& Publish)
 		{
-			LogReserveState state = m_orderedLogBuffer.GetReserveState();
-
-			if (state == LogReserveState::UNINITIALIZED ||
-				state != LogReserveState::RESERVED ||
-				state == LogReserveState::UNRESERVED)
+			LogFormatState state = FormatLogDataToArena(&Data);
+			if (state == LogFormatState::FAILURE_CAPACITY)
 			{
-				if (ReserveLogSlotsForTracking() != LogReserveState::RESERVED)
-				{
-					return LogTrackerState::FAILURE_NO_RESERVE;
-				}
+				if (!FlushArena(Publish)) return false;
+				state = FormatLogDataToArena(&Data);
 			}
 
-			if (m_trackedData.GetTrackerState() == LogTrackerState::UNINITIALIZED)
+			return state == LogFormatState::SUCCESS;
+		}
+
+
+		// Ingest Queues ------------------------------------------------------------------------------------------------------------
+
+		template<typename Publisher>
+		std::size_t IngestQueues(Publisher&& Publish, bool& bOutAllEmtpty, bool& bOutFailed)
+		{
+			std::size_t ingested = 0;
+			bOutAllEmtpty = true;
+			bOutFailed = false;
+
+			for (auto& context : m_loggerThreadRegistryPtr->m_threadContexts)
 			{
-				m_startSequenceThisPass = 0;
-			}
-			else
-			{
-				// This cannot result in a InvalidSequenceNumber
-				// since the OrderLogBuffer reserve plicy wont allow resering any slot that equals InvalidSequenceNumber
-				m_startSequenceThisPass = m_trackedData.Sequence_MaxTracked + 1;
-			}
+				auto& queue = context.ThreadQueue;
 
-			uint64_t start_reserveSeq = m_orderedLogBuffer.GetStartReservedSequenceNumber();
-
-			bool bAllQueueEmpty = true;
-
-			for (std::size_t threadIndex = 0; threadIndex < NumberOfThreads; ++threadIndex)
-			{
-				LogThreadContext& context = m_loggerRegistryPointer->m_threadContexts[threadIndex];
-				auto& buffer = context.ThreadQueue;
-
-				if (buffer.IsEmpty())
+				while (!queue.IsEmpty())
 				{
-					continue;
-				}
-				else
-				{
-					bAllQueueEmpty = false;
-				}
+					bOutAllEmtpty = false;
+					LogData& data = queue.PeekLogical(0);
+					const uint64_t seq = data.Sequence;
 
-				auto ItSnap = buffer.GetRingBufferIteratorSnapshot();
+					if (seq == InvalidSequenceNumber) { queue.Dequeue(); continue; }
 
-				for (auto it = ItSnap.Begin; it != ItSnap.End; ++it)
-				{
-					// If no log has been consumed/reserved then use expected as 0.
-					// This results in the index of the incoming sequence passing the threashold.
-					uint64_t expected = m_trackedData.GetTrackerState() == LogTrackerState::UNINITIALIZED
-						? 0
-						: m_trackedData.Sequence_MaxTracked + 1;
+					SequenceStatus status = m_buffer.Insert(seq, std::move(data));
 
-					if (expected == InvalidSequenceNumber)
+					if (status == SequenceStatus::BeyondCapacity)
 					{
-						return LogTrackerState::FAILURE_SENTINAL;
-					}
-
-					const LogData* queueBufferData = &(*it);
-
-					if (queueBufferData == nullptr)
-					{
-						std::cout << "Data is Null in SPSC Queue" << "\n";
-						assert(false && "Data is Null in SPSC Queue");
-						continue;
-					}
-
-					const uint64_t seq = queueBufferData->Sequence;
-
-					if (seq == InvalidSequenceNumber)
-					{
-						std::cout << "INVALID Sequence Number FOUND in Context Queue" << "\n";
-						continue;
-					}
-
-					if (m_lastPublishSequence != InvalidSequenceNumber && seq <= m_lastPublishSequence)		// Stale sequences bypass tracking
-					{
-						continue;
-					}
-
-					if (seq > m_orderedLogBuffer.GetEndReservedSequenceNumber()) // Sequence is out of Reserved range
-					{
+						// Exceeds the ordered ring capacity,
+						// leave the rest of the sequences to be dealt with in the next pass
 						break;
 					}
 
-					std::size_t bMissingIndex = Invalidindex;
-					OrderedLogSlot* orderedSlot = m_orderedLogBuffer.GetReservedSlot(seq);
-					if (orderedSlot == nullptr)
+					switch (status)
 					{
-						std::cout << "Invalid Slot. The Sequence Number was possibly not reserved" << "\n";
-						assert(false);
-						continue;
-					}
-
-					LogData* orderedData = orderedSlot->Data;
-
-					// If the slot returned by the LogBuffer, already contains a pointer to valid data,
-					// It is a data reserved in the last pass, and is waiting flush
-					if (orderedData != nullptr)
+					case SequenceStatus::Accepted:
 					{
-						continue;
-					}
-
-					// If expected > seq, then check if the seq is found in m_missingSequences
-					if (expected > seq)
-					{// If seq is not a missing tracked sequence, the seq has already been reserved in the previous pass and is waiting flush
-						if (m_trackedData.Sequence_Missing.size() > 0)
+						if (m_maxSeenSequence == InvalidSequenceNumber ||
+							seq > m_maxSeenSequence)
 						{
-							auto it = std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), seq);
-
-							if (it == m_trackedData.Sequence_Missing.end())
-							{
-								continue;
-							}
-
-							// If seq is a missing sequence, store the index, and pop only if successfully reserved
-							bMissingIndex = static_cast<std::size_t>(std::distance(m_trackedData.Sequence_Missing.begin(), it));
+							m_maxSeenSequence = seq;
 						}
-						else
-						{
-							__debugbreak();
-							assert(false);
-						}
+
+						++ingested;
+						break;
 					}
 
-					*orderedSlot = OrderedLogSlot(0, 0, seq, const_cast<LogData*>(queueBufferData));
-
-					// if expected < seq, reserve all Sequence Numbers between expected and seq
-					if (expected < seq)
+					case SequenceStatus::Duplicate:
 					{
-						// if seq > expected, mark all in between sequences as missing
-						// and push back into m_missingSequences
-						for (uint64_t missing = expected; missing < seq; ++missing)
-						{
-							m_trackedData.Sequence_Missing.push_back(missing);
-						}
+						++m_duplicantCount;
+						break;
 					}
 
-					if (m_trackedData.Sequence_End == InvalidSequenceNumber || m_trackedData.Sequence_End < seq)
+					case SequenceStatus::Stale:
 					{
-						m_trackedData.Sequence_End = seq;
-						m_trackedData.Sequence_MaxTracked = seq;
+						// Directly publish using the dedicated by-pass function
+						if (!FormatOrFlush(data, Publish)) { bOutFailed = true; return ingested; };
+						if (m_skippedLogCount > 0) --m_skippedLogCount;
+						++m_invertedCount;
+						break;
 					}
 
-					if (m_trackedData.Sequence_Begin == InvalidSequenceNumber)
+					default:
 					{
-						m_trackedData.Sequence_Begin = m_startSequenceThisPass;
+						throw "Invalid sequence status";
+					}
 					}
 
-					// If seq is a missing index, swap and pop from m_trackedData.SequenceMissing
-					if (bMissingIndex != Invalidindex)
-					{
-						std::swap(m_trackedData.Sequence_Missing[bMissingIndex], m_trackedData.Sequence_Missing.back());
-						m_trackedData.Sequence_Missing.pop_back();
-					}
+					// Pay load already lives in the ordered ring
+					queue.Dequeue();
 				}
 			}
 
-			if (m_trackedData.GetTrackerState() == LogTrackerState::UNINITIALIZED || m_trackedData.GetTrackerState() == LogTrackerState::UNTRACKED)
-			{
-				if (bAllQueueEmpty)
-				{
-					return LogTrackerState::FAILURE_EMPTY;
-				}
-			}
-
-			return m_trackedData.GetTrackerState();
+			return ingested;
 		}
 
 
+		// Consume Pass -------------------------------------------------------------------------------------------------------------
 
-
-		// Publish Log Data ----------------------------------------------------------------------------------------------------------
-		template <typename Publisher>
-		requires std::invocable<Publisher, LogArena&> &&
-						std::same_as<std::invoke_result_t<Publisher, LogArena&>,
-						LogPublishState>
-		LogPublishState PublishLogData(uint64_t EndSequenceNumber, Publisher&& PublishFunction)
+		template<typename Publisher>
+		requires (std::invocable<Publisher, LogArena&> &&
+				std::same_as<std::invoke_result_t<Publisher, LogArena&>, LogPublishState>)
+		ConsumePassResult ConsumePass(Publisher&& Publish)
 		{
-			if (m_trackedData.GetTrackerState() == LogTrackerState::UNINITIALIZED) return LogPublishState::FAILURE_UNINITIALIZED;
+			bool bAllEmpty = true;
+			bool bFailed = false;
 
-			if (m_orderedLogBuffer.IsEmpty()) return LogPublishState::FAILURE_EMPTY;
+			IngestQueues(Publish, bAllEmpty, bFailed);
+			if (bFailed) return { LogPublishState::INVALID_INTERNAL_STATE, 0, false, false };
 
-			if (m_trackedData.Sequence_Begin < m_orderedLogBuffer.GetStartReservedSequenceNumber()) return LogPublishState::INVALID_INTERNAL_STATE;
+			// Gap handling: head missing but later sequences exist
+			const bool bGap = m_buffer.GetReadyCount() == 0 &&
+				m_maxSeenSequence != InvalidSequenceNumber &&
+				m_maxSeenSequence > m_buffer.GetHeadSequence();
 
-			if (m_trackedData.Sequence_Begin > EndSequenceNumber || EndSequenceNumber == InvalidSequenceNumber) return LogPublishState::FAILURE_INVALID_SEQUENCE;
-
-			LogPublishState publishState = LogPublishState::SUCCESS;
-
-
-			uint64_t expected = m_lastPublishSequence == InvalidSequenceNumber
-				? 0
-				: m_lastPublishSequence + 1;
-
-			while (expected <= EndSequenceNumber)
+			if (bGap)
 			{
-				OrderedLogSlot* slot = m_orderedLogBuffer.GetReservedSlot(expected);
+				auto timeNow = NX_Clock::now();
 
-				if (slot == nullptr)
+				if (!m_bGapActive)
 				{
-					__debugbreak();
-					assert(false);
-					return LogPublishState::INVALID_INTERNAL_STATE;
+					m_bGapActive = true;
+					m_gapSince = timeNow;		// caller : spin/yeild and call again
 				}
-
-				LogData* data = slot->Data;
-
-				if (data == nullptr)
+				else if (timeNow - m_gapSince > g_gapTimeout)
 				{
-					++m_skippedLogCount;
-					++expected;
-					continue;
-				}
-
-				LogFormatState formatState = FormatLogDataToArena(data);
-
-				if (formatState == LogFormatState::INVALID_INTERNAL_STATE)
-				{
-					__debugbreak();
-					return LogPublishState::INVALID_INTERNAL_STATE;
-				}
-
-				// If Arena is at capacity, publish Formatted Logs and continue processing the pending Tracked Logs
-				if (formatState == LogFormatState::FAILURE_CAPACITY)
-				{
-					if (m_logArena.IsEmpty())
+					while (m_buffer.GetReadyCount() == 0 &&
+						m_maxSeenSequence <= m_buffer.GetHeadSequence())
 					{
-						return LogPublishState::INVALID_INTERNAL_STATE;
+						m_buffer.SkipMissingHead();
+						++m_skippedLogCount;
 					}
 
-					// PublishFunction only modifies m_lastPublishSequence if any log is actually published,
-					LogPublishState OutPublishState = PublishFunction(m_logArena);
-
-					if (OutPublishState != LogPublishState::SUCCESS)
-					{
-						assert(false);
-						return LogPublishState::INVALID_INTERNAL_STATE;
-					}
-					else
-					{
-						m_logArena.Clear();
-						m_lastPublishSequence = expected - 1;
-						continue;
-					}
+					m_bGapActive = false;
 				}
-
-				++expected;
-			}
-
-			// Publish Missing or Stale Logs to Sinks and Dequeue the ThreadContext Queues
-			// if m_skippedLogCount > 0, then search for missing or stale logs and publish
-			// else, simply dequeue
-			//
-			// Once the a context dequeue process enters a condition statment
-			// It enters a loop and cannot exit till loop condition is false
-			// Because of this, it needs a guard against m_skippedLogCount underflow
-
-
-			uint64_t begin = m_trackedData.Sequence_Begin;
-
-			for (auto& context : m_loggerRegistryPointer->m_threadContexts)
-			{
-				auto& logBuffer = context.ThreadQueue;
-
-				if (m_skippedLogCount > 0)
-				{
-					while (!logBuffer.IsEmpty() &&
-						logBuffer.PeekLogical(0).Sequence <= EndSequenceNumber)
-					{
-						if (m_skippedLogCount > 0)	// Underflow gaurd
-						{
-							uint64_t seq = logBuffer.PeekLogical(0).Sequence;
-							if (seq < begin)
-							{
-								FormatLogDataToArena(&logBuffer.PeekLogical(0));
-								--m_skippedLogCount;
-								++m_invertedLogCount;
-							}
-							else if (std::find(m_trackedData.Sequence_Missing.begin(), m_trackedData.Sequence_Missing.end(), seq) !=
-								m_trackedData.Sequence_Missing.end())
-							{
-								FormatLogDataToArena(&logBuffer.PeekLogical(0));
-								--m_skippedLogCount;
-								++m_invertedLogCount;
-							}
-						}
-
-						logBuffer.Dequeue();
-					}
-				}
-				else
-				{
-					while (!logBuffer.IsEmpty() && logBuffer.PeekLogical(0).Sequence <= EndSequenceNumber)
-					{
-
-						logBuffer.Dequeue();
-					}
-				}
-			}
-
-			// Publish Stale data from the Log Arena, if any
-			if (!m_logArena.IsEmpty())
-			{
-				// PublishFunction only modifies m_lastPublishSequence if any log is actually published,
-				LogPublishState OutPublishState = PublishFunction(m_logArena);
-
-				if (OutPublishState != LogPublishState::SUCCESS)
-				{
-					assert(false);
-					return LogPublishState::INVALID_INTERNAL_STATE;
-				}
-
-				m_logArena.Clear();
-			}
-
-			m_lastPublishSequence = m_trackedData.Sequence_End;
-
-
-			// Dereserve the m_orderedLogBuffer
-			LogReserveState reserveState = m_orderedLogBuffer.DereserveSequences(EndSequenceNumber);
-
-			if (reserveState != LogReserveState::DERESERVED && reserveState != LogReserveState::DERESERVED_EMPTY)
-			{
-				std::cout << "ERROR WITH DERESERVING SEQUENCES" << std::endl;
-				assert(false);
-				return LogPublishState::INVALID_INTERNAL_STATE;
-			}
-
-
-			// Update the m_trackedData
-			if (m_trackedData.Sequence_End == EndSequenceNumber)
-			{
-				m_trackedData.Sequence_Begin = InvalidSequenceNumber;
-				m_trackedData.Sequence_End = InvalidSequenceNumber;
 			}
 			else
 			{
-				m_trackedData.Sequence_Begin = EndSequenceNumber + 1;
+				m_bGapActive = false;
 			}
 
 
-			// Clear the Missing Sequences from the Tracked Data, older than the last published data
-			std::size_t MissingIndex = 0;
+			// Drain contiguous logs
+			// intermitently flush whenever the arena is full
+			bool bArenaFull = false;
+			bool bInternalError = false;
 
-			if (m_trackedData.Sequence_Missing.size() != 0)
+			while (m_buffer.GetReadyCount() > 0)
 			{
-				while (MissingIndex < m_trackedData.Sequence_Missing.size())
-				{
-					uint64_t missingSeq = m_trackedData.Sequence_Missing[MissingIndex];
+				bArenaFull = false;
 
-					if (missingSeq <= EndSequenceNumber)
+				m_buffer.DrainWhile([&](uint64_t, LogData& Data)
 					{
-						std::swap(m_trackedData.Sequence_Missing[MissingIndex], m_trackedData.Sequence_Missing.back());
-						m_trackedData.Sequence_Missing.pop_back();
-					}
-					else
+						const LogFormatState formatState = FormatLogDataToArena(&Data);
+
+						if (formatState == LogFormatState::SUCCESS) return true;
+						if (formatState == LogFormatState::FAILURE_CAPACITY) bArenaFull = true;
+						else bInternalError = true;
+
+						return false;
+					});
+
+				if (bInternalError)
+				{
+					return { LogPublishState::INVALID_INTERNAL_STATE,
+						m_lastPublishedSequence - m_buffer.GetHeadSequence(),
+						false, false };
+				}
+
+				if (bArenaFull)
+				{
+					if (m_logArena.IsEmpty() || !FlushArena(Publish))
 					{
-						++MissingIndex;
+						return { LogPublishState::INVALID_INTERNAL_STATE,
+							m_lastPublishedSequence - m_buffer.GetHeadSequence(),
+							false, false };
 					}
 				}
 			}
 
-			return publishState;
+			if (!FlushArena(Publish))
+			{
+				return { LogPublishState::INVALID_INTERNAL_STATE,
+						m_lastPublishedSequence - m_buffer.GetHeadSequence(),
+						false, false };
+			}
+
+			m_lastPublishedSequence = m_buffer.GetHeadSequence() - 1;
+
+			LogPublishState state = bGap ? LogPublishState::SUCCESS_WITH_MISSING : LogPublishState::SUCCESS;
+
+			return { state,
+				m_lastPublishedSequence - m_buffer.GetHeadSequence(),
+				false, false };
 		}
+
 
 	private:
 
@@ -1685,23 +1399,19 @@ X(Temp)							\
 		// Member Parameters
 		// =====================================
 
-		TrackedLogData m_trackedData;
-
-
-		OrderedLogBuffer m_orderedLogBuffer;
+		LoggerThreadRegistry* m_loggerThreadRegistryPtr;
+		ReorderBuffer<LogData, g_OrderedLogCapacity> m_buffer;
 		LogArena m_logArena;
 
-		std::size_t m_cursorStart = 0;
-		std::size_t m_cursorEnd = 0;
-
-		uint64_t m_startSequenceThisPass = InvalidSequenceNumber;
-
-		LoggerThreadRegistry* m_loggerRegistryPointer = nullptr;
-
-		//LogData MissingDataTemplate{0, Neyrx::Logger::LogCategory::Temp, Neyrx::Logger::LogLevel::Warning, "MISSING SEQUENCE NUMBER"};
-
-		uint64_t m_lastPublishSequence = InvalidSequenceNumber;
-		uint64_t m_invertedLogCount = 0;
+		uint64_t m_maxSeenSequence = InvalidSequenceNumber;
+		uint64_t m_lastPublishedSequence = InvalidSequenceNumber;
+		uint64_t m_duplicantCount = 0;
 		uint64_t m_skippedLogCount = 0;
+		uint64_t m_invertedCount = 0;
+
+		bool m_bGapActive = false;
+		NX_TimePoint m_gapSince;
+
+		static constexpr auto g_gapTimeout = std::chrono::microseconds(200);
 	};
 }
