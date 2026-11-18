@@ -1,4 +1,5 @@
 #include <conio.h>
+#include <filesystem>
 
 #include "Neyrx/Core/Logger/Logger.h"
 
@@ -9,47 +10,11 @@ using namespace Neyrx::Logger;
 static std::atomic<bool> StopProducer = false;
 static std::atomic<bool> StopConsumer = false;
 
-class TestSink : public ILoggerSink
-{
-public:
-
-	virtual ~TestSink() = default;
-
-    inline virtual LogPublishState Publish(LogArena& Arena) override
-    {
-		++m_messageCount;
-
-		return LogPublishState::SUCCESS;
-	}
-
-	uint64_t GetMessageCount() const
-	{
-		return m_messageCount;
-	}
-
-private:
-    uint64_t m_lastSequenceNumber = InvalidSequenceNumber;
-	uint64_t m_messageCount = 0;
-    std::atomic<bool> bFail = false;
-	std::atomic<int> m_inversionCount = 0;
-};
-
-struct MsgCount
-{
-	MsgCount() : count(0) {}
-
-	int count = 0;
-};
-
-inline static thread_local MsgCount g_msgCount;
 
 
-
-void InputLog(int& count)
+void InputLog()
 {
 	NX_LOG(NX_LOG_TEMP, NX_LOG_INFO, "Hello from thread ID: %d", 1);
-
-	count++;
 }
 
 void LogWorker()
@@ -65,12 +30,12 @@ void Worker()
 	NX_Logger.RegisterLogQueue();
 	while (!StopProducer)
 	{
-		for (int i = 0; i < 1024; ++i)
+		for (int i = 0; i < 2048; ++i)
 		{
-			InputLog(g_msgCount.count);
+			InputLog();
 		}
 
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		std::this_thread::sleep_for(std::chrono::microseconds(1));
 	}
 }
 
@@ -81,9 +46,13 @@ int main()
 	std::cout << "Starting Logger Test...\n";
 
 	NX_Logger.Initialize();
-	TestSink testSink;
-	NX_Logger.AddSink(&testSink);
 
+	std::filesystem::path root = PROJECT_ROOT_DIR;
+	std::string filestr = root.string().c_str();
+	filestr.append("/Log.txt");
+	const char* file = filestr.c_str();
+	FileSink testSink(file);
+	NX_Logger.AddSink(&testSink);
 
 	std::thread thread1(Worker);
 	std::thread thread2(Worker);
@@ -96,7 +65,7 @@ int main()
 
 	std::thread thread20(LogWorker);
 
-	std::this_thread::sleep_for(std::chrono::seconds(15));
+	std::this_thread::sleep_for(std::chrono::seconds(300));
 
 	StopProducer = true;
 
@@ -124,7 +93,7 @@ int main()
 
 	uint64_t inversionCount = NX_Logger.GetInvertedCount();
 	uint64_t skippedCount = NX_Logger.GetSkippedCount();
-	uint64_t MsgCount = testSink.GetMessageCount();
+	uint64_t MsgCount = NX_Logger.GetSequenceCount();
 
 	int result = -1;
 

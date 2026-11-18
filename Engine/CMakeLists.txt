@@ -15,7 +15,7 @@ add_library(
 
     # Public Headers
     Core/Public/Neyrx/Core/Time/NX_HighResTimer.h
-)
+ "Core/Private/Logger/Sink.cpp")
 
 target_include_directories(
     NeyrxCore

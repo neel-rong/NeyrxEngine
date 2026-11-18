@@ -1,4 +1,7 @@
 #pragma once
+#include <cstdio>
+#include <cassert>
+
 #include "Neyrx/Core/Logger/LogDataStructures.h"
 
 namespace Neyrx::Logger
@@ -13,7 +16,8 @@ namespace Neyrx::Logger
 
 		virtual ~ILoggerSink() = default;
 
-		virtual LogPublishState Publish(LogArena& Arena) = 0;
+		virtual LogPublishState Write(LogArena& Arena) = 0;
+		virtual void FlushOS() = 0;
 	};
 
 
@@ -23,15 +27,34 @@ namespace Neyrx::Logger
 	// Console Sink
 	// ==========================================================================================================
 
-	class IConsoleSink : public ILoggerSink
+	class ConsoleSink : public ILoggerSink
 	{
 	public:
 
-		virtual ~IConsoleSink() = default;
+		virtual ~ConsoleSink() = default;
 
-		inline virtual LogPublishState Publish(LogArena& Arena) override
-		{
-			return LogPublishState::SUCCESS;
-		}
+		virtual LogPublishState Write(LogArena& Arena) override;
+	};
+
+
+
+
+	// ==========================================================================================================
+	// File Sink
+	// ==========================================================================================================
+
+	class FileSink : public ILoggerSink
+	{
+	public:
+
+		FileSink(const char* FilePath);
+		virtual ~FileSink() override;
+
+		virtual LogPublishState Write(LogArena& Arena) override;
+		virtual void FlushOS() override;
+
+	private:
+
+		std::FILE* m_fileHandle = nullptr;
 	};
 }

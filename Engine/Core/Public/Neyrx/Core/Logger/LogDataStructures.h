@@ -1054,7 +1054,7 @@ X(Temp)							\
 		{
 			// Preflight: one strlen per string argument, lengths kept for the write pass
 
-			std::array<StringRef, g_maxLogArgumentCount> strings;
+			std::array<StringRef, g_maxLogArgumentCount> stringRefs;
 			std::size_t need = StaticSize;
 
 			if (StringArgumentCount > 0)
@@ -1065,12 +1065,11 @@ X(Temp)							\
 				{
 					if (FormatOperations[i].Type != LogFormatOpType::ArgumentLiteral) continue;
 
-					StringRef ref = MakeStringRef(InArguments[FormatOperations[i].ArgumentIndex].ArgValue.StringLiteral);
-					need += ref.Length;
+					stringRefs[k] = MakeStringRef(InArguments[FormatOperations[i].ArgumentIndex].ArgValue.StringLiteral);
+					need += stringRefs[k].Length;
 					++k;
 				}
 			}
-
 			if (!m_logArena.HasCapacityFor(need)) return LogFormatState::FAILURE_CAPACITY;
 
 			const size_t mark = m_logArena.GetMark();
@@ -1133,10 +1132,7 @@ X(Temp)							\
 
 				case LogFormatOpType::ArgumentLiteral :
 				{
-					const auto& argument = InArguments[op.ArgumentIndex];
-					const StringRef stringRef = MakeStringRef(argument.ArgValue.StringLiteral);
-
-					m_logArena.AppendUncheked(stringRef.Ptr, stringRef.Length);
+					m_logArena.AppendUncheked(stringRefs[OperationIndex].Ptr, stringRefs[OperationIndex].Length);
 
 					break;
 				}
@@ -1174,12 +1170,12 @@ X(Temp)							\
 					break;
 				}
 				}
-			}
 
-			if (!result)
-			{
-				m_logArena.Truncate(mark);
-				return LogFormatState::INVALID_INTERNAL_STATE;
+				if (!result)
+				{
+					m_logArena.Truncate(mark);
+					return LogFormatState::INVALID_INTERNAL_STATE;
+				}
 			}
 
 

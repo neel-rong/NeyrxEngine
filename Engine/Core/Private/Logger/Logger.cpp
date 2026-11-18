@@ -88,7 +88,7 @@ void Logger::TryAndPublishLogData()
 			LogPublishState state;
 			for (auto sink : m_sinks)
 			{
-				state = sink->Publish(Arena);
+				state = sink->Write(Arena);
 
 				if (state != LogPublishState::SUCCESS) assert(false && "Logger Sink failed to publish");
 			}
@@ -98,6 +98,11 @@ void Logger::TryAndPublishLogData()
 
 	switch (result.State)
 	{
+	case LogPublishState::SUCCESS :
+	{
+		break;
+	}
+
 	case LogPublishState::SUCCESS_WITH_MISSING :
 	{
 		NX_TimePoint now = NX_Clock::now();
@@ -123,6 +128,7 @@ void Logger::TryAndPublishLogData()
 
 	default :
 	{
+		__debugbreak();
 		assert(false && "Logger: Invalid internal state");
 		break;
 	}

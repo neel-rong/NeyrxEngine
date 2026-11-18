@@ -38,6 +38,10 @@ namespace Neyrx::Logger
 		LogThreadContext* GetLogThreadContext();
 		uint64_t GetInvertedCount();
 		uint64_t GetSkippedCount();
+		inline uint64_t GetSequenceCount()
+		{
+			return m_globalSequenceNumber.load(std::memory_order_relaxed);
+		}
 		bool IsIdle() const;
 
 		void TryAndPublishLogData();
